@@ -1,0 +1,71 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "MQTTClient.h"
+
+// MQTT configuration
+#define ADDRESS     "tcp://localhost:1883"
+#define CLIENTID    "solar-profit-client-c"
+#define TOPIC       "home/solar/profit"
+#define USERNAME    "your_user"
+#define PASSWORD    "your_pass"
+#define QOS         1
+#define TIMEOUT     10000L
+
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        printf("Usage: %s <power_used_kWh> <power_exported_kWh>\n", argv[0]);
+        return 1;
+    }
+
+    double power_used = atof(argv[1]);
+    double power_exported = atof(argv[2]);
+
+    if (power_used < 0 || power_exported < 0) {
+        printf("Error: power values must be non-negative.\n");
+        return 1;
+    }
+
+    double cost = power_used * 0.07;
+    double revenue = power_exported * 0.15;
+    double profit = revenue - cost;
+
+    char payload[64];
+    snprintf(payload, sizeof(payload), "Profit: £%.2f", profit);
+    printf("%s\n", payload);
+
+    // Set up MQTT
+    MQTTClient client;
+    MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+
+    MQTTClient_create(&client, ADDRESS, CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+
+    conn_opts.keepAliveInterval = 20;
+    conn_opts.cleansession = 1;
+    conn_opts.username = USERNAME;
+    conn_opts.password = PASSWORD;
+
+    int rc;
+    if ((rc = MQTTClient_connect(client, &conn_opts)) != MQTTCLIENT_SUCCESS) {
+        printf("Failed to connect to broker, return code %d\n", rc);
+        return 1;
+    }
+
+    MQTTClient_message pubmsg = MQTTClient_message_initializer;
+    MQTTClient_deliveryToken token;
+
+    pubmsg.payload = payload;
+    pubmsg.payloadlen = (int)strlen(payload);
+    pubmsg.qos = QOS;
+    pubmsg.retained = 0;
+
+    MQTTClient_publishMessage(client, TOPIC, &pubmsg, &token);
+    MQTTClient_waitForCompletion(client, token, TIMEOUT);
+
+    printf("Message published to topic '%s'\n", TOPIC);
+
+    MQTTClient_disconnect(client, 10000);
+    MQTTClient_destroy(&client);
+
+    return 0;
+}
