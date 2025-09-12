@@ -82,7 +82,7 @@ int main() {
     out_opts.password = PASSWORD;
 
     if (MQTTClient_connect(client_out, &out_opts) != MQTTCLIENT_SUCCESS) {
-        fprintf(stderr, "❌ Failed to connect to OUTPUT broker (%s)\n", OUT_ADDRESS);
+        fprintf(stderr, "Failed to connect to OUTPUT broker (%s)\n", OUT_ADDRESS);
         return 1;
     }
 
@@ -95,7 +95,7 @@ int main() {
     in_opts.password = PASSWORD;
 
     if (MQTTClient_connect(client_in, &in_opts) != MQTTCLIENT_SUCCESS) {
-        fprintf(stderr, "❌ Failed to connect to INPUT broker (%s)\n", IN_ADDRESS);
+        fprintf(stderr, "Failed to connect to INPUT broker (%s)\n", IN_ADDRESS);
         return 1;
     }
 
@@ -103,8 +103,8 @@ int main() {
     MQTTClient_subscribe(client_in, USED_TOPIC, QOS);
     MQTTClient_subscribe(client_in, EXPORTED_TOPIC, QOS);
 
-    printf("✅ Subscribed to INPUT broker [%s]:\n - %s\n - %s\n", IN_ADDRESS, USED_TOPIC, EXPORTED_TOPIC);
-    printf("📤 Publishing profit to OUTPUT broker [%s] on topic: %s\n", OUT_ADDRESS, OUTPUT_TOPIC);
+    printf("Subscribed to INPUT broker [%s]:\n - %s\n - %s\n", IN_ADDRESS, USED_TOPIC, EXPORTED_TOPIC);
+    printf("Publishing profit to OUTPUT broker [%s] on topic: %s\n", OUT_ADDRESS, OUTPUT_TOPIC);
 
     while (1) {
         sleep(1);
