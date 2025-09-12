@@ -1,0 +1,66 @@
+#include <iostream>
+#include <iomanip>
+#include <cstdlib>
+#include <string>
+#include <sstream>
+
+#include "mqtt/async_client.h"
+
+// MQTT Configuration
+const std::string SERVER_ADDRESS("tcp://192.168.0.160:1883");
+const std::string CLIENT_ID("solar-profit-client");
+const std::string TOPIC("home/solar/profit");
+
+// Hardcoded MQTT Credentials
+const std::string MQTT_USERNAME = "mqttuser";
+const std::string MQTT_PASSWORD = "mqttuser";
+
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        std::cerr << "Usage: " << argv[0] << " <power_used_kWh> <power_exported_kWh>\n";
+        return 1;
+    }
+
+    double powerUsed = std::atof(argv[1]);
+    double powerExported = std::atof(argv[2]);
+
+    if (powerUsed < 0 || powerExported < 0) {
+        std::cerr << "Error: Power values must be non-negative.\n";
+        return 1;
+    }
+
+    const double buyRate = 0.07;
+    const double sellRate = 0.15;
+
+    double cost = powerUsed * buyRate;
+    double revenue = powerExported * sellRate;
+    double profit = revenue - cost;
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2) << "Profit: £" << profit;
+    std::string payload = oss.str();
+
+    std::cout << payload << std::endl;
+
+    try {
+        mqtt::async_client client(SERVER_ADDRESS, CLIENT_ID);
+        mqtt::connect_options connOpts;
+        connOpts.set_user_name(MQTT_USERNAME);
+        connOpts.set_password(MQTT_PASSWORD);
+
+        client.connect(connOpts)->wait();
+
+        mqtt::message_ptr pubmsg = mqtt::make_message(TOPIC, payload);
+        pubmsg->set_qos(1);
+        client.publish(pubmsg)->wait();
+
+        client.disconnect()->wait();
+        std::cout << "Published to MQTT topic: " << TOPIC << std::endl;
+    }
+    catch (const mqtt::exception& exc) {
+        std::cerr << "MQTT Error: " << exc.what() << std::endl;
+        return 1;
+    }
+
+    return 0;
+}
