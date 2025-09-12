@@ -3,25 +3,25 @@
 #include <string.h>
 #include "MQTTClient.h"
 
-// --- Input Broker (for subscriptions) ---
-#define IN_ADDRESS     "tcp://192.168.1.10:1883"
-#define IN_CLIENTID    "solar-profit-subscriber"
-#define IN_USERNAME    "input_user"
-#define IN_PASSWORD    "input_pass"
+// --- Shared MQTT credentials for both brokers ---
+#define USERNAME        "mqttuser"
+#define PASSWORD        "mqttuser"
 
-// --- Output Broker (for publishing) ---
-#define OUT_ADDRESS    "tcp://localhost:1883"
-#define OUT_CLIENTID   "solar-profit-publisher"
-#define OUT_USERNAME   "output_user"
-#define OUT_PASSWORD   "output_pass"
+// --- Input Broker ---
+#define IN_ADDRESS      "tcp://192.168.0.177:1883"
+#define IN_CLIENTID     "solar-profit-subscriber"
+
+// --- Output Broker ---
+#define OUT_ADDRESS     "tcp://192.168.0.160:1883"
+#define OUT_CLIENTID    "solar-profit-publisher"
 
 // --- MQTT Topics ---
-#define USED_TOPIC     "home/solar/used"
-#define EXPORTED_TOPIC "home/solar/exported"
-#define OUTPUT_TOPIC   "home/solar/profit"
+#define USED_TOPIC      "home/solar/used"
+#define EXPORTED_TOPIC  "home/solar/exported"
+#define OUTPUT_TOPIC    "home/solar/profit"
 
-#define QOS            1
-#define TIMEOUT        10000L
+#define QOS             1
+#define TIMEOUT         10000L
 
 MQTTClient client_in;
 MQTTClient client_out;
@@ -46,7 +46,7 @@ void maybe_publish_profit() {
         int rc = MQTTClient_publishMessage(client_out, OUTPUT_TOPIC, &pubmsg, &token);
         MQTTClient_waitForCompletion(client_out, token, TIMEOUT);
 
-        printf("Used: %.2f, Exported: %.2f → Profit: %s (published to output broker)\n", used, exported, result);
+        printf("Used: %.2f, Exported: %.2f → Profit: %s (published)\n", used, exported, result);
     }
 }
 
@@ -78,11 +78,11 @@ int main() {
     MQTTClient_create(&client_out, OUT_ADDRESS, OUT_CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
     out_opts.keepAliveInterval = 20;
     out_opts.cleansession = 1;
-    out_opts.username = OUT_USERNAME;
-    out_opts.password = OUT_PASSWORD;
+    out_opts.username = USERNAME;
+    out_opts.password = PASSWORD;
 
     if (MQTTClient_connect(client_out, &out_opts) != MQTTCLIENT_SUCCESS) {
-        fprintf(stderr, "❌ Failed to connect to OUTPUT broker.\n");
+        fprintf(stderr, "❌ Failed to connect to OUTPUT broker (%s)\n", OUT_ADDRESS);
         return 1;
     }
 
@@ -91,31 +91,28 @@ int main() {
     MQTTClient_create(&client_in, IN_ADDRESS, IN_CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
     in_opts.keepAliveInterval = 20;
     in_opts.cleansession = 1;
-    in_opts.username = IN_USERNAME;
-    in_opts.password = IN_PASSWORD;
+    in_opts.username = USERNAME;
+    in_opts.password = PASSWORD;
 
     if (MQTTClient_connect(client_in, &in_opts) != MQTTCLIENT_SUCCESS) {
-        fprintf(stderr, "❌ Failed to connect to INPUT broker.\n");
+        fprintf(stderr, "❌ Failed to connect to INPUT broker (%s)\n", IN_ADDRESS);
         return 1;
     }
 
-    // Set up subscriptions
     MQTTClient_setCallbacks(client_in, NULL, NULL, messageArrived, NULL);
     MQTTClient_subscribe(client_in, USED_TOPIC, QOS);
     MQTTClient_subscribe(client_in, EXPORTED_TOPIC, QOS);
 
-    printf("✅ Listening to input broker [%s] for:\n - %s\n - %s\n", IN_ADDRESS, USED_TOPIC, EXPORTED_TOPIC);
-    printf("📤 Will publish results to output broker [%s] on topic: %s\n\n", OUT_ADDRESS, OUTPUT_TOPIC);
+    printf("✅ Subscribed to INPUT broker [%s]:\n - %s\n - %s\n", IN_ADDRESS, USED_TOPIC, EXPORTED_TOPIC);
+    printf("📤 Publishing profit to OUTPUT broker [%s] on topic: %s\n", OUT_ADDRESS, OUTPUT_TOPIC);
 
-    // Loop forever
     while (1) {
         sleep(1);
     }
 
-    // Cleanup (not reached in this loop)
+    // Cleanup (not reached)
     MQTTClient_disconnect(client_in, 10000);
     MQTTClient_destroy(&client_in);
-
     MQTTClient_disconnect(client_out, 10000);
     MQTTClient_destroy(&client_out);
 
