@@ -1,17 +1,6 @@
 // sa_ws_profit.c
-// Simple scraper: fetch the SolarAssistant page HTML, extract today's Grid Used & Grid Export,
-// compute profit, publish to MQTT. No websockets. No cookies. No DevTools.
-//
-// Build (mac/Homebrew):
-//   gcc -std=c11 -O2 -o sa_ws_profit sa_ws_profit.c \
-//     $(pkg-config --cflags libcurl openssl) \
-//     -lpaho-mqtt3c \
-//     $(pkg-config --libs libcurl openssl) \
-//     -lpthread -Wl,-rpath,/opt/homebrew/lib
-//
-// Run:
-//   ./sa_ws_profit                       # defaults to http://192.168.0.177
-//   ./sa_ws_profit http://192.168.0.177  # or pass explicit URL
+// Fetches http://192.168.0.177/totals, extracts two numbers (Used kWh, Export kWh),
+// computes profit, publishes to MQTT. That's it.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,8 +9,9 @@
 #include <curl/curl.h>
 #include "MQTTClient.h"
 
-// ====== CONFIG ======
-#define DEFAULT_HTTP_URL "http://192.168.0.177"   // page that shows the numbers
+// ---- CONFIG (edit if needed) ----
+#define TOTALS_URL   "http://192.168.0.177/totals"
+
 #define MQTT_HOST     "tcp://192.168.0.160:1883"
 #define MQTT_CLIENTID "sa-profit-publisher"
 #define MQTT_USER     "mqttuser"
@@ -30,129 +20,19 @@
 
 #define IMPORT_TARIFF 0.07   // £/kWh
 #define EXPORT_TARIFF 0.15   // £/kWh
-// =====================
+// ---------------------------------
 
 struct mem { char *data; size_t len; };
-static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
-    size_t cnt = size * nmemb;
-    struct mem *m = (struct mem *)userdata;
-    char *p = (char *)realloc(m->data, m->len + cnt + 1);
+static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *ud) {
+    size_t n = size * nmemb;
+    struct mem *m = (struct mem*)ud;
+    char *p = (char*)realloc(m->data, m->len + n + 1);
     if (!p) return 0;
     m->data = p;
-    memcpy(m->data + m->len, ptr, cnt);
-    m->len += cnt;
+    memcpy(m->data + m->len, ptr, n);
+    m->len += n;
     m->data[m->len] = 0;
-    return cnt;
-}
-
-static char *strcasestr_fast(const char *h, const char *n) {
-    if (!*n) return (char*)h;
-    size_t nl = strlen(n);
-    for (const char *p = h; *p; p++) {
-        if (tolower((unsigned char)*p) == tolower((unsigned char)*n)) {
-            if (strncasecmp(p, n, nl) == 0) return (char*)p;
-        }
-    }
-    return NULL;
-}
-
-// Parse a double from s[start..end) moving leftwards/rightwards to capture "123.45"
-static int parse_number_near(const char *s, size_t start, size_t end, double *out) {
-    // Expand around 'start' to find a number
-    size_t i = start, j = start;
-    while (i > 0 && (isdigit((unsigned char)s[i-1]) || s[i-1]=='.')) i--;
-    while (j < end && (isdigit((unsigned char)s[j]) || s[j]=='.')) j++;
-    if (j > i) {
-        char buf[64];
-        size_t n = j - i; if (n >= sizeof(buf)) n = sizeof(buf)-1;
-        memcpy(buf, s+i, n); buf[n]=0;
-        *out = atof(buf);
-        return 1;
-    }
-    return 0;
-}
-
-// Strategy A: look for chart-like JSON "d":[[ ... ]], pick columns 5 & 6 (0-based)
-static int try_extract_from_chart_json(const char *html, double *used, double *exp) {
-    const char *d = strstr(html, "\"d\":[[");
-    if (!d) return 0;
-    d += 5;
-    const char *row = strchr(d, '[');
-    if (!row) return 0;
-    int depth = 0; const char *p = row;
-    while (*p) {
-        if (*p=='[') depth++;
-        else if (*p==']') { depth--; if (depth==0) { p++; break; } }
-        p++;
-        if (p - row > 4000) break;
-    }
-    if (depth != 0) return 0;
-
-    char buf[3000];
-    size_t n = (size_t)(p - row);
-    if (n >= sizeof(buf)) n = sizeof(buf)-1;
-    memcpy(buf, row, n); buf[n] = 0;
-
-    int col = 0;
-    char *save = NULL;
-    char *tok = strtok_r(buf, ",", &save);
-    double u = -1, e = -1;
-    while (tok) {
-        while (*tok==' '||*tok=='['||*tok=='\"') tok++;
-        size_t L = strlen(tok);
-        while (L && (tok[L-1]==' '||tok[L-1]==']'||tok[L-1]=='\"')) tok[--L]=0;
-        if (col==5) u = atof(tok);
-        else if (col==6) e = atof(tok);
-        if (u>=0 && e>=0) break;
-        col++;
-        tok = strtok_r(NULL, ",", &save);
-    }
-    if (u>=0 && e>=0) { *used=u; *exp=e; return 1; }
-    return 0;
-}
-
-// Strategy B: scan for "Used" / "Export" (or "Grid Used"/"Grid Export") near numbers with "kWh"
-static int find_kwh_after_label(const char *html, const char *label, double *val_out) {
-    const char *p = html;
-    while ((p = strcasestr_fast(p, label)) != NULL) {
-        // Search forward a small window for a number followed by "kWh"
-        const size_t WIN = 350;
-        const char *q = p;
-        const char *end = p + WIN;
-        // find "kWh"
-        const char *kwh = strcasestr_fast(q, "kwh");
-        if (kwh && kwh < end) {
-            // parse number immediately before kWh
-            double v;
-            size_t start = (kwh - html);
-            if (parse_number_near(html, start, start, &v)) {
-                *val_out = v;
-                return 1;
-            }
-        }
-        // Alternative: number then "kWh" later in window
-        for (const char *r = q; r < end && *r; r++) {
-            if (isdigit((unsigned char)*r)) {
-                double v;
-                if (parse_number_near(html, (size_t)(r - html), (size_t)(end - html), &v)) {
-                    const char *after = r;
-                    const char *k2 = strcasestr_fast(after, "kwh");
-                    if (k2 && k2 < end) { *val_out = v; return 1; }
-                }
-            }
-        }
-        p = p + strlen(label);
-    }
-    return 0;
-}
-
-// Strategy C: look for table headers "Used" / "Export" and numbers in same row
-static int try_extract_from_table_headers(const char *html, double *used, double *exp) {
-    double u=-1, e=-1;
-    int fu = find_kwh_after_label(html, "Grid Used", &u) || find_kwh_after_label(html, "Used", &u);
-    int fe = find_kwh_after_label(html, "Grid Export", &e) || find_kwh_after_label(html, "Export", &e);
-    if (fu && fe) { *used=u; *exp=e; return 1; }
-    return 0;
+    return n;
 }
 
 static int http_get(const char *url, struct mem *out) {
@@ -160,73 +40,110 @@ static int http_get(const char *url, struct mem *out) {
     if (!c) return -1;
     curl_easy_setopt(c, CURLOPT_URL, url);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(c, CURLOPT_USERAGENT, "Mozilla/5.0");
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "curl/7");
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, out);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 4L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 8L);
     CURLcode rc = curl_easy_perform(c);
     curl_easy_cleanup(c);
     return rc == CURLE_OK ? 0 : -1;
 }
 
-int main(int argc, char **argv) {
-    const char *http_url = (argc > 1) ? argv[1] : DEFAULT_HTTP_URL;
+// Find first float starting at/after idx; returns end index or -1
+static long scan_float(const char *s, long idx, double *out) {
+    while (s[idx] && !(isdigit((unsigned char)s[idx]) || s[idx]=='.' || s[idx]=='-' )) idx++;
+    if (!s[idx]) return -1;
+    char buf[64]; int bi=0;
+    while (s[idx] && (isdigit((unsigned char)s[idx]) || s[idx]=='.' || s[idx]=='e' || s[idx]=='E' || s[idx]=='+' || s[idx]=='-')) {
+        if (bi < (int)sizeof(buf)-1) buf[bi++] = s[idx];
+        idx++;
+    }
+    buf[bi] = 0;
+    *out = atof(buf);
+    return idx;
+}
 
+static char *istrstr(const char *h, const char *n) { // case-insensitive strstr
+    if (!*n) return (char*)h;
+    size_t nl = strlen(n);
+    for (const char *p=h; *p; p++) if (tolower((unsigned char)*p) == tolower((unsigned char)*n))
+        if (strncasecmp(p,n,nl)==0) return (char*)p;
+    return NULL;
+}
+
+// Tries:
+// 1) Labeled: "used" ... number, "export" ... number (case-insensitive)
+// 2) First two floats in the document
+static int extract_two_numbers(const char *s, double *used, double *exp) {
+    const char *p_used = istrstr(s, "used");
+    const char *p_export = istrstr(s, "export");
+    long i; double a,b;
+
+    if (p_used && p_export) {
+        long uidx = (long)(p_used - s);
+        long eidx = (long)(p_export - s);
+        long uend = scan_float(s, uidx, &a);
+        long eend = scan_float(s, eidx, &b);
+        if (uend != -1 && eend != -1) { *used = a; *exp = b; return 1; }
+    }
+    // Fallback: first two floats anywhere
+    i = 0;
+    long e1 = scan_float(s, i, &a);
+    if (e1 == -1) return 0;
+    long e2 = scan_float(s, e1, &b);
+    if (e2 == -1) return 0;
+    *used = a; *exp = b;
+    return 1;
+}
+
+int main(void) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     struct mem page = {0};
-    if (http_get(http_url, &page) != 0 || !page.data || !page.len) {
-        fprintf(stderr, "Failed to fetch page: %s\n", http_url);
+    if (http_get(TOTALS_URL, &page) != 0 || !page.data || !page.len) {
+        fprintf(stderr, "Failed to fetch %s\n", TOTALS_URL);
         curl_global_cleanup();
         return 1;
     }
 
-    double used = -1.0, exp = -1.0;
-
-    // Try in order: chart JSON -> headers/labels
-    if (!try_extract_from_chart_json(page.data, &used, &exp)) {
-        (void)try_extract_from_table_headers(page.data, &used, &exp);
-    }
-
-    free(page.data);
-
-    if (used < 0.0 || exp < 0.0) {
-        fprintf(stderr, "Could not find both Used and Export numbers on the page.\n");
+    double used=-1, exp=-1;
+    if (!extract_two_numbers(page.data, &used, &exp)) {
+        fprintf(stderr, "Could not parse two numbers from %s\n", TOTALS_URL);
+        free(page.data);
         curl_global_cleanup();
         return 2;
     }
+    free(page.data);
 
     double profit = exp * EXPORT_TARIFF - used * IMPORT_TARIFF;
-    printf("Used: %.2f kWh, Exported: %.2f kWh -> Profit: %.2f (£)\n", used, exp, profit);
+    printf("Used: %.3f kWh, Exported: %.3f kWh -> Profit: %.3f (£)\n", used, exp, profit);
 
-    // Publish to MQTT
-    MQTTClient mqtt;
+    // Publish to MQTT (tiny)
+    MQTTClient cli;
     MQTTClient_connectOptions opts = MQTTClient_connectOptions_initializer;
-    MQTTClient_create(&mqtt, MQTT_HOST, MQTT_CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
-    opts.keepAliveInterval = 20;
+    MQTTClient_create(&cli, MQTT_HOST, MQTT_CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+    opts.keepAliveInterval = 15;
     opts.cleansession = 1;
     opts.username = MQTT_USER;
     opts.password = MQTT_PASS;
-    if (MQTTClient_connect(mqtt, &opts) != MQTTCLIENT_SUCCESS) {
-        fprintf(stderr, "Failed to connect to MQTT broker\n");
-        MQTTClient_destroy(&mqtt);
-        curl_global_cleanup();
-        return 3;
+
+    if (MQTTClient_connect(cli, &opts) == MQTTCLIENT_SUCCESS) {
+        char payload[64];
+        snprintf(payload, sizeof(payload), "%.3f", profit);
+        MQTTClient_message msg = MQTTClient_message_initializer;
+        msg.payload = payload;
+        msg.payloadlen = (int)strlen(payload);
+        msg.qos = 1;
+        msg.retained = 0;
+        MQTTClient_deliveryToken tok;
+        MQTTClient_publishMessage(cli, MQTT_TOPIC, &msg, &tok);
+        MQTTClient_waitForCompletion(cli, tok, 1500);
+        MQTTClient_disconnect(cli, 1000);
+    } else {
+        fprintf(stderr, "MQTT connect failed (skipping publish)\n");
     }
-
-    MQTTClient_message pubmsg = MQTTClient_message_initializer;
-    char payload[64];
-    snprintf(payload, sizeof(payload), "%.2f", profit);
-    pubmsg.payload = payload;
-    pubmsg.payloadlen = (int)strlen(payload);
-    pubmsg.qos = 1;
-    pubmsg.retained = 0;
-    MQTTClient_deliveryToken token;
-    MQTTClient_publishMessage(mqtt, MQTT_TOPIC, &pubmsg, &token);
-    MQTTClient_waitForCompletion(mqtt, token, 1500);
-
-    MQTTClient_disconnect(mqtt, 1000);
-    MQTTClient_destroy(&mqtt);
+    MQTTClient_destroy(&cli);
     curl_global_cleanup();
-
     return 0;
 }
