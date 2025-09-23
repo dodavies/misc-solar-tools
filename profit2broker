@@ -1,5 +1,5 @@
 // sa_ws_profit.c
-// Self-contained: fetch session + CSRF via libcurl, then connect WebSocket via libwebsockets.
+// Browser-like: fetch cookies + CSRF + static assets, then connect Phoenix LiveView WS.
 // Publishes calculated profit to MQTT.
 //
 // Build (mac/Homebrew):
@@ -11,7 +11,6 @@
 //
 // Run:
 //   ./sa_ws_profit               # defaults to http://192.168.0.177
-//   or
 //   ./sa_ws_profit http://192.168.0.177
 
 #include <stdio.h>
@@ -24,7 +23,6 @@
 #include <curl/curl.h>
 #include <ctype.h>
 
-// ====== CONFIG YOU CAN EDIT ======
 #define MQTT_HOST     "tcp://192.168.0.160:1883"
 #define MQTT_CLIENTID "sa-profit-publisher"
 #define MQTT_USER     "mqttuser"
@@ -33,14 +31,11 @@
 
 #define IMPORT_TARIFF 0.07
 #define EXPORT_TARIFF 0.15
-#define TIMEOUT_SEC   45  // give it a bit longer on first run
+#define TIMEOUT_SEC   60
 
-// Default HTTP base if you don't pass argv[1]
 #define DEFAULT_HTTP_BASE "http://192.168.0.177"
-// LiveView fixed path & version
 #define LIVE_WS_PATH      "/live/websocket"
 #define LIVE_VSN          "2.0.0"
-// =================================
 
 static int done = 0;
 static int joined = 0;
@@ -50,97 +45,55 @@ static time_t start_ts = 0, last_hb = 0;
 static MQTTClient mqtt;
 static unsigned long next_ref = 1;
 
-// headers we append during the WS handshake
 static char g_cookie[4096] = {0};
 static char g_origin[512]  = {0};
 
-static void make_ref(char *out, size_t n) {
-    snprintf(out, n, "%lu", next_ref++);
-}
+static void make_ref(char *out, size_t n) { snprintf(out, n, "%lu", next_ref++); }
 
-// ---------- small helpers ----------
 static char *strcasestr_fast(const char *h, const char *n) {
     if (!*n) return (char*)h;
     size_t nl = strlen(n);
-    for (const char *p = h; *p; p++) {
-        if (tolower((unsigned char)*p) == tolower((unsigned char)*n)) {
-            if (strncasecmp(p, n, nl) == 0) return (char*)p;
-        }
-    }
+    for (const char *p = h; *p; p++) if (tolower((unsigned char)*p) == tolower((unsigned char)*n))
+        if (strncasecmp(p, n, nl) == 0) return (char*)p;
     return NULL;
 }
-static int starts_with(const char *s, const char *pfx) {
-    return strncmp(s, pfx, strlen(pfx)) == 0;
-}
+static int starts_with(const char *s, const char *pfx) { return strncmp(s, pfx, strlen(pfx)) == 0; }
 static int looks_like_csrf(const char *s) {
-    if (!s) return 0;
-    size_t n = strlen(s);
-    if (n < 16 || n > 256) return 0;
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)s[i];
-        if (!(isalnum(c) || c=='_' || c=='-' || c=='+' || c=='/' || c=='=')) return 0;
-    }
+    if (!s) return 0; size_t n = strlen(s); if (n < 16 || n > 256) return 0;
+    for (size_t i=0;i<n;i++){ unsigned char c=s[i];
+        if(!(isalnum(c)||c=='_'||c=='-'||c=='+'||c=='/'||c=='=')) return 0; }
     return 1;
 }
 
-// ===== libcurl helpers =====
 struct mem { char *data; size_t len; };
 static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
-    size_t cnt = size * nmemb;
-    struct mem *m = (struct mem *)userdata;
-    char *p = (char*)realloc(m->data, m->len + cnt + 1);
-    if (!p) return 0;
-    m->data = p;
-    memcpy(m->data + m->len, ptr, cnt);
-    m->len += cnt;
-    m->data[m->len] = '\0';
-    return cnt;
+    size_t cnt = size*nmemb; struct mem *m=(struct mem*)userdata;
+    char *p=(char*)realloc(m->data, m->len+cnt+1); if(!p) return 0;
+    m->data=p; memcpy(m->data+m->len,ptr,cnt); m->len+=cnt; m->data[m->len]=0; return cnt;
 }
 
 static int parse_host_from_url(const char *base, char *host, size_t hostsz, int *port, int *is_tls) {
-    // base like http(s)://host[:port][/...]
-    const char *p = strstr(base, "://");
-    *is_tls = 0;
-    if (p) {
-        if (!strncasecmp(base, "https", 5)) *is_tls = 1;
-        p += 3;
-    } else {
-        p = base;
-    }
-    const char *slash = strchr(p, '/');
-    const char *colon = strchr(p, ':');
+    const char *p = strstr(base, "://"); *is_tls = 0;
+    if (p) { if (!strncasecmp(base, "https", 5)) *is_tls = 1; p += 3; } else { p = base; }
+    const char *slash = strchr(p, '/'); const char *colon = strchr(p, ':');
     if (slash && colon && colon < slash) {
-        size_t hlen = (size_t)(colon - p);
-        if (hlen >= hostsz) hlen = hostsz - 1;
-        memcpy(host, p, hlen); host[hlen] = 0;
-        *port = atoi(colon + 1);
-    } else {
-        size_t hlen = slash ? (size_t)(slash - p) : strlen(p);
-        if (hlen >= hostsz) hlen = hostsz - 1;
-        memcpy(host, p, hlen); host[hlen] = 0;
-        *port = *is_tls ? 443 : 80;
-    }
+        size_t hlen=(size_t)(colon-p); if(hlen>=hostsz) hlen=hostsz-1; memcpy(host,p,hlen); host[hlen]=0; *port=atoi(colon+1);
+    } else { size_t hlen= slash? (size_t)(slash-p) : strlen(p); if(hlen>=hostsz) hlen=hostsz-1; memcpy(host,p,hlen); host[hlen]=0; *port=*is_tls?443:80; }
     return 0;
 }
 
 static char *extract_csrf_from_meta(const char *html) {
-    // Look for: <meta name="csrf-token" content="...">
     const char *m = html;
     while ((m = strcasestr_fast(m, "<meta")) != NULL) {
-        const char *name = strcasestr_fast(m, "name=");
-        if (!name) { m++; continue; }
-        const char *q1 = strchr(name, '"'); if (!q1) { m++; continue; }
-        const char *q2 = strchr(q1+1, '"'); if (!q2) { m++; continue; }
-        if (strncasecmp(q1+1, "csrf-token", (size_t)(q2-(q1+1))) == 0) {
-            const char *cont = strcasestr_fast(q2, "content=");
-            if (!cont) { m++; continue; }
-            const char *c1 = strchr(cont, '"'); if (!c1) { m++; continue; }
-            const char *c2 = strchr(c1+1, '"'); if (!c2) { m++; continue; }
-            size_t n = (size_t)(c2 - (c1+1));
-            char *out = (char*)malloc(n + 1);
-            if (!out) return NULL;
-            memcpy(out, c1+1, n); out[n] = 0;
-            return out;
+        const char *name = strcasestr_fast(m, "name="); if(!name){m++;continue;}
+        const char *q1=strchr(name,'"'); if(!q1){m++;continue;}
+        const char *q2=strchr(q1+1,'"'); if(!q2){m++;continue;}
+        if (strncasecmp(q1+1,"csrf-token",(size_t)(q2-(q1+1)))==0) {
+            const char *cont=strcasestr_fast(q2,"content="); if(!cont){m++;continue;}
+            const char *c1=strchr(cont,'"'); if(!c1){m++;continue;}
+            const char *c2=strchr(c1+1,'"'); if(!c2){m++;continue;}
+            size_t n=(size_t)(c2-(c1+1)); char *out=(char*)malloc(n+1); if(!out) return NULL;
+            memcpy(out,c1+1,n); out[n]=0; return out;
         }
         m++;
     }
@@ -148,129 +101,71 @@ static char *extract_csrf_from_meta(const char *html) {
 }
 
 static char *extract_csrf_from_text_generic(const char *s) {
-    // Look for patterns like _csrf_token:"...", _csrf_token":"...", _csrfToken:"..."
-    const char *p = s;
-    while ((p = strcasestr_fast(p, "_csrf_token")) != NULL) {
-        const char *colon = strchr(p, ':'); if (!colon) { p++; continue; }
-        const char *q = colon + 1;
-        while (*q && isspace((unsigned char)*q)) q++;
-        if (*q != '"' && *q != '\'') { p++; continue; }
-        char quote = *q++;
-        const char *end = strchr(q, quote);
-        if (!end) { p++; continue; }
-        size_t n = (size_t)(end - q);
-        if (n >= 16 && n < 256) {
-            char *out = (char*)malloc(n + 1);
-            if (!out) return NULL;
-            memcpy(out, q, n); out[n] = 0;
-            if (looks_like_csrf(out)) return out;
-            free(out);
-        }
-        p = end + 1;
-    }
-    // also try _csrfToken
-    p = s;
-    while ((p = strcasestr_fast(p, "_csrfToken")) != NULL) {
-        const char *q = strchr(p, '"');
-        if (!q) { p++; continue; }
-        q++;
-        const char *end = strchr(q, '"');
-        if (!end) { p++; continue; }
-        size_t n = (size_t)(end - q);
-        if (n > 0 && n < 1024) {
-            char *out = (char*)malloc(n + 1);
-            if (!out) return NULL;
-            memcpy(out, q, n); out[n] = 0;
-            if (looks_like_csrf(out)) return out;
-            free(out);
-        }
-        p++;
+    const char *p=s;
+    while((p=strcasestr_fast(p,"_csrf_token"))!=NULL){
+        const char *colon=strchr(p,':'); if(!colon){p++;continue;}
+        const char *q=colon+1; while(*q && isspace((unsigned char)*q)) q++;
+        if(*q!='"' && *q!='\''){p++;continue;} char quote=*q++;
+        const char *end=strchr(q,quote); if(!end){p++;continue;}
+        size_t n=(size_t)(end-q); if(n>=16&&n<256){ char *out=(char*)malloc(n+1); if(!out) return NULL;
+            memcpy(out,q,n); out[n]=0; if(looks_like_csrf(out)) return out; free(out); }
+        p=end+1;
     }
     return NULL;
 }
 
 static int build_cookie_header_from_curl(CURL *easy, char *out, size_t outsz) {
-    struct curl_slist *cookies = NULL, *nc;
-    CURLcode rc = curl_easy_getinfo(easy, CURLINFO_COOKIELIST, &cookies);
-    if (rc != CURLE_OK || !cookies) return -1;
-
-    size_t used = 0;
-    for (nc = cookies; nc; nc = nc->next) {
-        // Netscape cookie format: domain \t flag \t path \t secure \t expiry \t name \t value
-        const char *line = nc->data;
-        int tabs = 0;
-        const char *p = line, *name = NULL, *val = NULL;
-        while (*p) {
-            if (*p == '\t') {
-                tabs++;
-                if (tabs == 5) name = p + 1;
-                if (tabs == 6) { val = p + 1; break; }
-            }
-            p++;
-        }
-        if (!name || !val) continue;
-        const char *name_end = strchr(name, '\t'); if (!name_end) continue;
-        const char *val_end  = strchr(val, '\t');  if (!val_end)  val_end = line + strlen(line);
-
-        size_t nlen = (size_t)(name_end - name);
-        size_t vlen = (size_t)(val_end - val);
-
-        if (used + nlen + 1 + vlen + 2 >= outsz) break;
-        if (used) out[used++] = ' ';
-        memcpy(out + used, name, nlen); used += nlen;
-        out[used++] = '=';
-        memcpy(out + used, val, vlen); used += vlen;
-        out[used++] = ';';
+    struct curl_slist *cookies=NULL,*nc; CURLcode rc=curl_easy_getinfo(easy,CURLINFO_COOKIELIST,&cookies);
+    if(rc!=CURLE_OK||!cookies) return -1; size_t used=0;
+    for(nc=cookies;nc;nc=nc->next){ const char *line=nc->data; int tabs=0; const char *p=line,*name=NULL,*val=NULL;
+        while(*p){ if(*p=='\t'){ tabs++; if(tabs==5) name=p+1; if(tabs==6){ val=p+1; break; } } p++; }
+        if(!name||!val) continue; const char *name_end=strchr(name,'\t'); if(!name_end) continue;
+        const char *val_end=strchr(val,'\t'); if(!val_end) val_end=line+strlen(line);
+        size_t nlen=(size_t)(name_end-name), vlen=(size_t)(val_end-val);
+        if(used+nlen+1+vlen+2>=outsz) break; if(used) out[used++]=' ';
+        memcpy(out+used,name,nlen); used+=nlen; out[used++]='='; memcpy(out+used,val,vlen); used+=vlen; out[used++]=';';
     }
-    if (used && out[used-1] == ';') used--;
-    out[used] = 0;
-
-    curl_slist_free_all(cookies);
-    return used ? 0 : -1;
+    if(used&&out[used-1]==';') used--; out[used]=0; curl_slist_free_all(cookies); return used?0:-1;
 }
 
 static int absolute_url(char *dst, size_t dsz, const char *base, const char *src) {
-    if (starts_with(src, "http://") || starts_with(src, "https://")) {
-        snprintf(dst, dsz, "%s", src);
-        return 0;
+    if (starts_with(src,"http://")||starts_with(src,"https://")) { snprintf(dst, dsz, "%s", src); return 0; }
+    char host[256]; int port=80,tls=0; parse_host_from_url(base,host,sizeof(host),&port,&tls);
+    const char *scheme=tls?"https":"http";
+    if(*src=='/') {
+        if((tls&&port==443)||(!tls&&port==80)) snprintf(dst,dsz,"%s://%s%s",scheme,host,src);
+        else snprintf(dst,dsz,"%s://%s:%d%s",scheme,host,port,src);
+    } else {
+        if((tls&&port==443)||(!tls&&port==80)) snprintf(dst,dsz,"%s://%s/%s",scheme,host,src);
+        else snprintf(dst,dsz,"%s://%s:%d/%s",scheme,host,port,src);
     }
-    char host[256]; int port=80, tls=0;
-    parse_host_from_url(base, host, sizeof(host), &port, &tls);
-    const char *scheme = tls ? "https" : "http";
-    if (*src == '/') {
-        if ((tls && port==443) || (!tls && port==80))
-            snprintf(dst, dsz, "%s://%s%s", scheme, host, src);
-        else
-            snprintf(dst, dsz, "%s://%s:%d%s", scheme, host, port, src);
-        return 0;
-    }
-    if ((tls && port==443) || (!tls && port==80))
-        snprintf(dst, dsz, "%s://%s/%s", scheme, host, src);
-    else
-        snprintf(dst, dsz, "%s://%s:%d/%s", scheme, host, port, src);
     return 0;
 }
 
-static void collect_script_srcs(const char *html, const char *base, char list[][512], int *count, int max_items) {
-    *count = 0;
-    const char *p = html;
-    while ((p = strcasestr_fast(p, "<script")) != NULL) {
-        const char *s = strcasestr_fast(p, "src=");
-        if (!s) { p++; continue; }
-        const char *q1 = strchr(s, '"'); if (!q1) { p++; continue; }
-        const char *q2 = strchr(q1+1, '"'); if (!q2) { p++; continue; }
-        size_t n = (size_t)(q2 - (q1+1));
-        if (n > 0 && n < 480) {
-            char rel[512]; memcpy(rel, q1+1, n); rel[n]=0;
-            char abs[512];
-            absolute_url(abs, sizeof(abs), base, rel);
-            if (*count < max_items) {
-                snprintf(list[*count], 512, "%s", abs);
-                (*count)++;
-            }
-        }
-        p = q2 + 1;
-        if (*count >= max_items) break;
+static void collect_script_and_css_srcs(const char *html, const char *base, char list[][512], int *count, int max_items) {
+    *count=0; const char *p=html;
+    // <script src="...">
+    while ((p=strcasestr_fast(p,"<script"))!=NULL) {
+        const char *s=strcasestr_fast(p,"src="); if(!s){p++;continue;}
+        const char *q1=strchr(s,'"'); if(!q1){p++;continue;}
+        const char *q2=strchr(q1+1,'"'); if(!q2){p++;continue;}
+        size_t n=(size_t)(q2-(q1+1)); if(n>0&&n<480){ char rel[512]; memcpy(rel,q1+1,n); rel[n]=0; char abs[512]; absolute_url(abs,sizeof(abs),base,rel);
+            if(*count<max_items){ snprintf(list[*count],512,"%s",abs); (*count)++; } }
+        p=q2+1; if(*count>=max_items) break;
+    }
+    // <link rel="stylesheet" href="...">
+    p=html;
+    while ((p=strcasestr_fast(p,"<link"))!=NULL) {
+        const char *rel=strcasestr_fast(p,"rel="); if(!rel){p++;continue;}
+        const char *rq1=strchr(rel,'"'); if(!rq1){p++;continue;}
+        const char *rq2=strchr(rq1+1,'"'); if(!rq2){p++;continue;}
+        if (strncasecmp(rq1+1,"stylesheet",(size_t)(rq2-(rq1+1)))!=0) { p++; continue; }
+        const char *h=strcasestr_fast(p,"href="); if(!h){p++;continue;}
+        const char *hq1=strchr(h,'"'); if(!hq1){p++;continue;}
+        const char *hq2=strchr(hq1+1,'"'); if(!hq2){p++;continue;}
+        size_t n=(size_t)(hq2-(hq1+1)); if(n>0&&n<480){ char relp[512]; memcpy(relp,hq1+1,n); relp[n]=0; char abs[512]; absolute_url(abs,sizeof(abs),base,relp);
+            if(*count<max_items){ snprintf(list[*count],512,"%s",abs); (*count)++; } }
+        p=hq2+1; if(*count>=max_items) break;
     }
 }
 
@@ -283,12 +178,10 @@ static int http_fetch_with_handle(CURL *easy, const char *url, struct mem *out) 
     return rc == CURLE_OK ? 0 : -1;
 }
 
-static int http_fetch_base_and_csrf(const char *http_base, char **out_ws_url) {
+static int http_fetch_base_and_build_ws_url(const char *http_base, char **out_ws_url) {
     *out_ws_url = NULL;
-    CURL *easy = curl_easy_init();
-    if (!easy) return -1;
+    CURL *easy = curl_easy_init(); if(!easy) return -1;
 
-    // keep cookies in this handle
     curl_easy_setopt(easy, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(easy, CURLOPT_USERAGENT, "Mozilla/5.0");
     curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
@@ -301,9 +194,7 @@ static int http_fetch_base_and_csrf(const char *http_base, char **out_ws_url) {
     if (curl_easy_perform(easy) != CURLE_OK) { curl_easy_cleanup(easy); free(body.data); return -1; }
 
     // cookies -> g_cookie (best-effort)
-    if (build_cookie_header_from_curl(easy, g_cookie, sizeof(g_cookie)) != 0) {
-        g_cookie[0] = '\0';
-    }
+    if (build_cookie_header_from_curl(easy, g_cookie, sizeof(g_cookie)) != 0) g_cookie[0] = '\0';
 
     // Origin from base
     char host[256]; int port = 80, is_tls = 0;
@@ -313,178 +204,141 @@ static int http_fetch_base_and_csrf(const char *http_base, char **out_ws_url) {
     else
         snprintf(g_origin, sizeof(g_origin), "%s://%s:%d", is_tls ? "https" : "http", host, port);
 
-    // 1) Try meta tag
+    // CSRF candidates
     char *csrf = extract_csrf_from_meta(body.data ? body.data : "");
 
-    // 2) If not found, fetch scripts and scan for _csrf_token
+    // collect static assets for _track_static[]
+    char assets[16][512]; int ac = 0;
+    collect_script_and_css_srcs(body.data ? body.data : "", http_base, assets, &ac, 16);
+
+    // If CSRF not found in meta, scan first few JS assets for _csrf_token
     if (!csrf) {
-        char scripts[10][512]; int sc = 0;
-        collect_script_srcs(body.data ? body.data : "", http_base, scripts, &sc, 10);
-        for (int i=0; i<sc && !csrf; i++) {
+        for (int i=0; i<ac && i<10 && !csrf; i++) {
             struct mem js = {0};
-            if (http_fetch_with_handle(easy, scripts[i], &js) == 0) {
+            if (http_fetch_with_handle(easy, assets[i], &js) == 0) {
                 csrf = extract_csrf_from_text_generic(js.data ? js.data : "");
             }
             free(js.data);
         }
     }
+
     free(body.data);
 
-    // Build WS URL (with valid csrf or without)
+    // Build WS URL
     const char *ws_scheme = is_tls ? "wss" : "ws";
-    char tmp[1024];
+    char query[2048]; size_t qlen = 0;
+    // vsn
+    qlen += snprintf(query+qlen, sizeof(query)-qlen, "vsn=%s", LIVE_VSN);
+    // csrf (only if valid)
     int have_valid_csrf = (csrf && looks_like_csrf(csrf));
     if (have_valid_csrf) {
         char *enc = curl_easy_escape(easy, csrf, 0);
-        if (enc) {
-            if ((is_tls && port == 443) || (!is_tls && port == 80))
-                snprintf(tmp, sizeof(tmp), "%s://%s%s?vsn=%s&_csrf_token=%s",
-                         ws_scheme, host, LIVE_WS_PATH, LIVE_VSN, enc);
-            else
-                snprintf(tmp, sizeof(tmp), "%s://%s:%d%s?vsn=%s&_csrf_token=%s",
-                         ws_scheme, host, port, LIVE_WS_PATH, LIVE_VSN, enc);
-            curl_free(enc);
-        } else {
-            have_valid_csrf = 0;
-        }
+        if (enc) { qlen += snprintf(query+qlen, sizeof(query)-qlen, "&_csrf_token=%s", enc); curl_free(enc); }
+        else have_valid_csrf = 0;
     }
-    if (!have_valid_csrf) {
-        if ((is_tls && port == 443) || (!is_tls && port == 80))
-            snprintf(tmp, sizeof(tmp), "%s://%s%s?vsn=%s",
-                     ws_scheme, host, LIVE_WS_PATH, LIVE_VSN);
-        else
-            snprintf(tmp, sizeof(tmp), "%s://%s:%d%s?vsn=%s",
-                     ws_scheme, host, port, LIVE_WS_PATH, LIVE_VSN);
+    // _track_static[]
+    for (int i=0; i<ac && qlen < sizeof(query)-32; i++) {
+        char *enc = curl_easy_escape(easy, assets[i], 0);
+        if (!enc) continue;
+        qlen += snprintf(query+qlen, sizeof(query)-qlen, "&_track_static%%5B%d%%5D=%s", i, enc);
+        curl_free(enc);
     }
-    if (csrf) free(csrf);
+    // mounts + referer
+    qlen += snprintf(query+qlen, sizeof(query)-qlen, "&_mounts=0&_live_referer=undefined");
 
+    char ws_url[2048];
+    if ((is_tls && port == 443) || (!is_tls && port == 80))
+        snprintf(ws_url, sizeof(ws_url), "%s://%s%s?%s", ws_scheme, host, LIVE_WS_PATH, query);
+    else
+        snprintf(ws_url, sizeof(ws_url), "%s://%s:%d%s?%s", ws_scheme, host, port, LIVE_WS_PATH, query);
+
+    if (csrf) free(csrf);
     curl_easy_cleanup(easy);
-    *out_ws_url = strdup(tmp);
+
+    *out_ws_url = strdup(ws_url);
     return *out_ws_url ? 0 : -5;
 }
 
-// ===== Phoenix + LWS helpers =====
+// ---------- Phoenix + LWS ----------
 static void ws_send_lws(struct lws *wsi, const char *msg) {
     unsigned char buf[LWS_PRE + 1024];
-    size_t len = strlen(msg);
-    if (len > 1000) len = 1000;
+    size_t len = strlen(msg); if (len > 1000) len = 1000;
     memcpy(&buf[LWS_PRE], msg, len);
     lws_write(wsi, &buf[LWS_PRE], len, LWS_WRITE_TEXT);
 }
-
 static void send_join(struct lws *wsi, const char *topic) {
     char ref[32]; make_ref(ref, sizeof(ref));
     char msg[256];
     snprintf(msg, sizeof(msg), "[\"%s\",\"%s\",\"%s\",\"phx_join\",{}]", ref, ref, topic);
     ws_send_lws(wsi, msg);
 }
-
 static void send_heartbeat(struct lws *wsi) {
     char ref[32]; make_ref(ref, sizeof(ref));
     char msg[128];
     snprintf(msg, sizeof(msg), "[null,\"%s\",\"phoenix\",\"heartbeat\",{}]", ref);
     ws_send_lws(wsi, msg);
 }
-
 static int extract_lv_topic(const char *s, char *out, size_t outsz) {
-    const char *p = strstr(s, "lv:phx-");
-    if (!p) return 0;
-    const char *e = strchr(p, '"');
-    if (!e) return 0;
-    size_t n = (size_t)(e - p);
-    if (n >= outsz) n = outsz - 1;
-    strncpy(out, p, n);
-    out[n] = '\0';
+    const char *p = strstr(s, "lv:phx-"); if (!p) return 0;
+    const char *e = strchr(p, '"'); if (!e) return 0;
+    size_t n = (size_t)(e - p); if (n >= outsz) n = outsz - 1;
+    strncpy(out, p, n); out[n] = 0;
     return strcmp(out, "lv:phx-0") != 0;
 }
-
-// Parse first daily row from "d":[[ ... ]] and pick columns 6 & 7 (0-based 5 & 6).
+// first daily row: "d":[[ ... ]] -> cols 5 (used) and 6 (export)
 static void parse_daily_first_row_for_used_exp(const char *s) {
-    const char *d = strstr(s, "\"d\":[[");
-    if (!d) return;
-    d += 5;
-    const char *row = strchr(d, '[');
-    if (!row) return;
-    int depth = 0;
-    const char *p = row;
-    while (*p) {
-        if (*p == '[') depth++;
-        else if (*p == ']') { depth--; if (depth == 0) { p++; break; } }
-        p++;
-        if (p - row > 2000) break;
-    }
+    const char *d = strstr(s, "\"d\":[["); if (!d) return; d += 5;
+    const char *row = strchr(d, '['); if (!row) return;
+    int depth = 0; const char *p = row;
+    while (*p) { if (*p=='[') depth++; else if (*p==']'){ depth--; if(depth==0){ p++; break; } } p++; if (p-row>2000) break; }
     if (depth != 0) return;
-
-    char buf[1200];
-    size_t n = (size_t)(p - row);
-    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
-    memcpy(buf, row, n);
-    buf[n] = '\0';
-
-    int col = 0;
-    char *save = NULL;
-    char *tok = strtok_r(buf, ",", &save);
+    char buf[1200]; size_t n=(size_t)(p-row); if(n>=sizeof(buf)) n=sizeof(buf)-1; memcpy(buf,row,n); buf[n]=0;
+    int col=0; char *save=NULL; char *tok=strtok_r(buf,",",&save);
     while (tok) {
-        while (*tok == ' ' || *tok == '[' || *tok == '\"') tok++;
-        size_t L = strlen(tok);
-        while (L && (tok[L-1] == ' ' || tok[L-1] == ']' || tok[L-1] == '\"')) { tok[--L] = '\0'; }
-
-        if (col == 5) grid_used = atof(tok);
-        else if (col == 6) grid_exp = atof(tok);
-        if (grid_used >= 0.0 && grid_exp >= 0.0) break;
-
-        col++;
-        tok = strtok_r(NULL, ",", &save);
+        while (*tok==' '||*tok=='['||*tok=='\"') tok++;
+        size_t L=strlen(tok); while(L && (tok[L-1]==' '||tok[L-1]==']'||tok[L-1]=='\"')) tok[--L]=0;
+        if (col==5) grid_used=atof(tok); else if (col==6) grid_exp=atof(tok);
+        if (grid_used>=0.0 && grid_exp>=0.0) break;
+        col++; tok=strtok_r(NULL,",",&save);
     }
 }
-
-struct ws_user { const char *path; };
 
 static int cb(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
     (void)user;
     switch (reason) {
         case LWS_CALLBACK_CLIENT_ESTABLISHED:
             last_hb = time(NULL);
+            // Bootstrap join on dummy; some servers reply "stale" and then emit the real topic
+            send_join(wsi, "lv:phx-0");
             break;
 
         case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER: {
             unsigned char **p = (unsigned char **)in;
             unsigned char *end = (*p) + len;
             if (g_cookie[0]) {
-                int rc = lws_add_http_header_by_name(wsi,
-                    (const unsigned char *)"Cookie:",
-                    (const unsigned char *)g_cookie,
-                    (int)strlen(g_cookie), p, end);
-                (void)rc;
+                (void) lws_add_http_header_by_name(wsi, (const unsigned char *)"Cookie:",
+                    (const unsigned char *)g_cookie, (int)strlen(g_cookie), p, end);
             }
             if (g_origin[0]) {
-                int rc = lws_add_http_header_by_name(wsi,
-                    (const unsigned char *)"Origin:",
-                    (const unsigned char *)g_origin,
-                    (int)strlen(g_origin), p, end);
-                (void)rc;
+                (void) lws_add_http_header_by_name(wsi, (const unsigned char *)"Origin:",
+                    (const unsigned char *)g_origin, (int)strlen(g_origin), p, end);
             }
             break;
         }
 
         case LWS_CALLBACK_CLIENT_WRITEABLE:
-            if (difftime(time(NULL), last_hb) >= 30) {
-                send_heartbeat(wsi);
-                last_hb = time(NULL);
-            }
+            if (difftime(time(NULL), last_hb) >= 25) { send_heartbeat(wsi); last_hb = time(NULL); }
             break;
 
         case LWS_CALLBACK_CLIENT_RECEIVE: {
-            char msg[8192];
-            size_t ncopy = len < sizeof(msg)-1 ? len : sizeof(msg)-1;
-            memcpy(msg, in, ncopy);
-            msg[ncopy] = '\0';
+            char msg[8192]; size_t ncopy = len < sizeof(msg)-1 ? len : sizeof(msg)-1;
+            memcpy(msg, in, ncopy); msg[ncopy] = 0;
 
+            // if server hints the real LV topic, join it
             if (!joined) {
                 char tmp[128];
                 if (extract_lv_topic(msg, tmp, sizeof(tmp))) {
-                    strncpy(lv_topic, tmp, sizeof(lv_topic)-1);
-                    lv_topic[sizeof(lv_topic)-1] = 0;
+                    strncpy(lv_topic, tmp, sizeof(lv_topic)-1); lv_topic[sizeof(lv_topic)-1]=0;
                     send_join(wsi, lv_topic);
                     joined = 1;
                     last_hb = time(NULL);
@@ -495,16 +349,12 @@ static int cb(struct lws *wsi, enum lws_callback_reasons reason, void *user, voi
                 parse_daily_first_row_for_used_exp(msg);
                 if (grid_used >= 0.0 && grid_exp >= 0.0) {
                     double profit = grid_exp * EXPORT_TARIFF - grid_used * IMPORT_TARIFF;
-                    printf("Used: %.2f kWh, Exported: %.2f kWh → Profit: %.2f\n",
-                           grid_used, grid_exp, profit);
+                    printf("Used: %.2f kWh, Exported: %.2f kWh → Profit: %.2f\n", grid_used, grid_exp, profit);
 
                     MQTTClient_message pubmsg = MQTTClient_message_initializer;
-                    char payload[64];
-                    snprintf(payload, sizeof(payload), "%.2f", profit);
-                    pubmsg.payload = payload;
-                    pubmsg.payloadlen = (int)strlen(payload);
-                    pubmsg.qos = 1;
-                    pubmsg.retained = 0;
+                    char payload[64]; snprintf(payload, sizeof(payload), "%.2f", profit);
+                    pubmsg.payload = payload; pubmsg.payloadlen = (int)strlen(payload);
+                    pubmsg.qos = 1; pubmsg.retained = 0;
                     MQTTClient_deliveryToken token;
                     MQTTClient_publishMessage(mqtt, MQTT_TOPIC, &pubmsg, &token);
                     MQTTClient_waitForCompletion(mqtt, token, 1500);
@@ -519,34 +369,20 @@ static int cb(struct lws *wsi, enum lws_callback_reasons reason, void *user, voi
             fprintf(stderr, "WebSocket connection error\n");
             done = 1;
             break;
-        default:
-            break;
+        default: break;
     }
     return 0;
 }
 
-static struct lws_protocols protocols[] = {
-    { "ws", cb, 0, 8192 },
-    { NULL, NULL, 0, 0 }
-};
+static struct lws_protocols protocols[] = { { "ws", cb, 0, 8192 }, { NULL, NULL, 0, 0 } };
 
 static void parse_ws_url(const char *url, char *host, int *port, char *path, size_t psz, int *is_tls) {
-    const char *p = strstr(url, "://");
-    *is_tls = 0;
+    const char *p = strstr(url, "://"); *is_tls = 0;
     if (p) { if (!strncasecmp(url, "wss", 3)) *is_tls = 1; p += 3; } else p = url;
-    const char *slash = strchr(p, '/');
-    const char *colon = strchr(p, ':');
-    if (slash && colon && colon < slash) {
-        size_t hlen = (size_t)(colon - p);
-        strncpy(host, p, hlen); host[hlen] = '\0';
-        *port = atoi(colon+1);
-    } else {
-        size_t hlen = slash ? (size_t)(slash - p) : strlen(p);
-        strncpy(host, p, hlen); host[hlen] = '\0';
-        *port = *is_tls ? 443 : 80;
-    }
-    if (slash) strncpy(path, slash, psz-1), path[psz-1] = '\0';
-    else strncpy(path, "/", psz-1), path[psz-1] = '\0';
+    const char *slash = strchr(p,'/'); const char *colon = strchr(p,':');
+    if (slash && colon && colon < slash) { size_t hlen=(size_t)(colon-p); strncpy(host,p,hlen); host[hlen]=0; *port=atoi(colon+1); }
+    else { size_t hlen= slash ? (size_t)(slash-p) : strlen(p); strncpy(host,p,hlen); host[hlen]=0; *port=*is_tls?443:80; }
+    if (slash) { strncpy(path, slash, psz-1); path[psz-1]=0; } else { strncpy(path, "/", psz-1); path[psz-1]=0; }
 }
 
 int main(int argc, char **argv) {
@@ -554,75 +390,48 @@ int main(int argc, char **argv) {
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    // 1) Fetch base page -> cookies + try to find CSRF in meta or JS
+    // Build LiveView-style WS URL (with cookies, csrf if valid, _track_static[], mounts, referer)
     char *ws_url = NULL;
-    if (http_fetch_base_and_csrf(http_base, &ws_url) != 0 || !ws_url) {
-        fprintf(stderr, "Failed to auto-acquire session/CSRF from %s\n", http_base);
-        curl_global_cleanup();
-        return 1;
+    if (http_fetch_base_and_build_ws_url(http_base, &ws_url) != 0 || !ws_url) {
+        fprintf(stderr, "Failed to prepare WS URL from %s\n", http_base);
+        curl_global_cleanup(); return 1;
     }
-    // Indicate whether CSRF param is present
-    fprintf(stderr, "WS URL: %s%s\n", ws_url, (strstr(ws_url, "_csrf_token=") ? "" : "  (no CSRF param)"));
+    fprintf(stderr, "WS URL: %s\n", ws_url);
     if (g_cookie[0]) fprintf(stderr, "Cookie: %s\n", g_cookie);
     if (g_origin[0]) fprintf(stderr, "Origin: %s\n", g_origin);
 
-    // 2) MQTT connect
+    // MQTT connect
     MQTTClient_connectOptions opts = MQTTClient_connectOptions_initializer;
     MQTTClient_create(&mqtt, MQTT_HOST, MQTT_CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
-    opts.keepAliveInterval = 20;
-    opts.cleansession = 1;
-    opts.username = MQTT_USER;
-    opts.password = MQTT_PASS;
+    opts.keepAliveInterval = 20; opts.cleansession = 1; opts.username = MQTT_USER; opts.password = MQTT_PASS;
     if (MQTTClient_connect(mqtt, &opts) != MQTTCLIENT_SUCCESS) {
         fprintf(stderr, "Failed to connect to MQTT broker\n");
-        free(ws_url);
-        curl_global_cleanup();
-        return 1;
+        free(ws_url); curl_global_cleanup(); return 1;
     }
 
-    // 3) LWS context
-    struct lws_context_creation_info info;
-    memset(&info, 0, sizeof(info));
-    info.port = CONTEXT_PORT_NO_LISTEN;
-    info.protocols = protocols;
-
+    // LWS
+    struct lws_context_creation_info info; memset(&info, 0, sizeof(info));
+    info.port = CONTEXT_PORT_NO_LISTEN; info.protocols = protocols;
     struct lws_context *context = lws_create_context(&info);
-    if (!context) {
-        fprintf(stderr, "Failed to create lws context\n");
-        free(ws_url);
-        curl_global_cleanup();
-        return 1;
-    }
+    if (!context) { fprintf(stderr, "Failed to create lws context\n"); free(ws_url); curl_global_cleanup(); return 1; }
 
-    // 4) Connect WS
-    char host[256], path[1024];
-    int port = 80, is_tls = 0;
+    char host[256], path[1024]; int port=80, is_tls=0;
     parse_ws_url(ws_url, host, &port, path, sizeof(path), &is_tls);
 
-    struct lws_client_connect_info ccinfo;
-    memset(&ccinfo, 0, sizeof(ccinfo));
-    ccinfo.context = context;
-    ccinfo.address = host;
-    ccinfo.port = port;
-    ccinfo.path = path;           // includes query
-    ccinfo.host = host;
-    ccinfo.origin = host;
-    ccinfo.protocol = "ws";
+    struct lws_client_connect_info ccinfo; memset(&ccinfo, 0, sizeof(ccinfo));
+    ccinfo.context = context; ccinfo.address = host; ccinfo.port = port; ccinfo.path = path;
+    ccinfo.host = host; ccinfo.origin = host; ccinfo.protocol = "ws";
 #if LWS_LIBRARY_VERSION_MAJOR >= 4
     ccinfo.ssl_connection = is_tls ? LCCSCF_USE_SSL : 0;
 #endif
 
     if (!lws_client_connect_via_info(&ccinfo)) {
         fprintf(stderr, "Failed to connect WebSocket\n");
-        lws_context_destroy(context);
-        free(ws_url);
-        curl_global_cleanup();
-        return 1;
+        lws_context_destroy(context); free(ws_url); curl_global_cleanup(); return 1;
     }
 
     start_ts = time(NULL);
 
-    // 5) Event loop with timeout
     while (!done) {
         lws_service(context, 100);
         lws_callback_on_writable_all_protocol(context, &protocols[0]);
