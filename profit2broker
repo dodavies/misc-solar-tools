@@ -1,5 +1,5 @@
 // sa_ws_profit.c
-// Browser-like: fetch cookies + try multiple CSRF discovery paths, then join Phoenix LiveView WS.
+// Self-contained: fetch session + CSRF via libcurl, then connect WebSocket via libwebsockets.
 // Publishes calculated profit to MQTT.
 //
 // Build (mac/Homebrew):
@@ -9,9 +9,9 @@
 //     $(pkg-config --libs libwebsockets libcurl openssl) \
 //     -lpthread -Wl,-rpath,/opt/homebrew/lib
 //
-// Run (defaults are fine for your LAN):
-//   ./sa_ws_profit
-//   # or with an explicit HTTP base (no trailing slash needed)
+// Run:
+//   ./sa_ws_profit               # defaults to http://192.168.0.177
+//   or
 //   ./sa_ws_profit http://192.168.0.177
 
 #include <stdio.h>
@@ -58,7 +58,7 @@ static void make_ref(char *out, size_t n) {
     snprintf(out, n, "%lu", next_ref++);
 }
 
-// ---------- tiny string utils ----------
+// ---------- small helpers ----------
 static char *strcasestr_fast(const char *h, const char *n) {
     if (!*n) return (char*)h;
     size_t nl = strlen(n);
@@ -71,6 +71,16 @@ static char *strcasestr_fast(const char *h, const char *n) {
 }
 static int starts_with(const char *s, const char *pfx) {
     return strncmp(s, pfx, strlen(pfx)) == 0;
+}
+static int looks_like_csrf(const char *s) {
+    if (!s) return 0;
+    size_t n = strlen(s);
+    if (n < 16 || n > 256) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!(isalnum(c) || c=='_' || c=='-' || c=='+' || c=='/' || c=='=')) return 0;
+    }
+    return 1;
 }
 
 // ===== libcurl helpers =====
@@ -138,22 +148,25 @@ static char *extract_csrf_from_meta(const char *html) {
 }
 
 static char *extract_csrf_from_text_generic(const char *s) {
-    // Look for patterns like _csrf_token:"...", _csrf_token":"...", or _csrfToken:"..."
+    // Look for patterns like _csrf_token:"...", _csrf_token":"...", _csrfToken:"..."
     const char *p = s;
     while ((p = strcasestr_fast(p, "_csrf_token")) != NULL) {
-        const char *q = strchr(p, '"');
-        if (!q) { p++; continue; }
-        q++; // after first quote
-        const char *end = strchr(q, '"');
+        const char *colon = strchr(p, ':'); if (!colon) { p++; continue; }
+        const char *q = colon + 1;
+        while (*q && isspace((unsigned char)*q)) q++;
+        if (*q != '"' && *q != '\'') { p++; continue; }
+        char quote = *q++;
+        const char *end = strchr(q, quote);
         if (!end) { p++; continue; }
         size_t n = (size_t)(end - q);
-        if (n > 0 && n < 1024) {
+        if (n >= 16 && n < 256) {
             char *out = (char*)malloc(n + 1);
             if (!out) return NULL;
             memcpy(out, q, n); out[n] = 0;
-            return out;
+            if (looks_like_csrf(out)) return out;
+            free(out);
         }
-        p++;
+        p = end + 1;
     }
     // also try _csrfToken
     p = s;
@@ -168,7 +181,8 @@ static char *extract_csrf_from_text_generic(const char *s) {
             char *out = (char*)malloc(n + 1);
             if (!out) return NULL;
             memcpy(out, q, n); out[n] = 0;
-            return out;
+            if (looks_like_csrf(out)) return out;
+            free(out);
         }
         p++;
     }
@@ -220,7 +234,6 @@ static int absolute_url(char *dst, size_t dsz, const char *base, const char *src
         snprintf(dst, dsz, "%s", src);
         return 0;
     }
-    // base like http://host[:port][/...]
     char host[256]; int port=80, tls=0;
     parse_host_from_url(base, host, sizeof(host), &port, &tls);
     const char *scheme = tls ? "https" : "http";
@@ -231,7 +244,6 @@ static int absolute_url(char *dst, size_t dsz, const char *base, const char *src
             snprintf(dst, dsz, "%s://%s:%d%s", scheme, host, port, src);
         return 0;
     }
-    // relative path: just stick after a slash
     if ((tls && port==443) || (!tls && port==80))
         snprintf(dst, dsz, "%s://%s/%s", scheme, host, src);
     else
@@ -262,24 +274,6 @@ static void collect_script_srcs(const char *html, const char *base, char list[][
     }
 }
 
-static int http_fetch(const char *url, struct mem *out) {
-    CURL *easy = curl_easy_init();
-    if (!easy) return -1;
-    curl_easy_setopt(easy, CURLOPT_URL, url);
-    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(easy, CURLOPT_WRITEDATA, out);
-    curl_easy_setopt(easy, CURLOPT_COOKIEFILE, ""); // enable cookie jar
-    curl_easy_setopt(easy, CURLOPT_USERAGENT, "Mozilla/5.0");
-    CURLcode rc = curl_easy_perform(easy);
-    if (rc != CURLE_OK) { curl_easy_cleanup(easy); return -1; }
-    // build cookies
-    int ck = build_cookie_header_from_curl(easy, g_cookie, sizeof(g_cookie));
-    (void)ck;
-    curl_easy_cleanup(easy);
-    return 0;
-}
-
 static int http_fetch_with_handle(CURL *easy, const char *url, struct mem *out) {
     curl_easy_setopt(easy, CURLOPT_URL, url);
     curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
@@ -306,9 +300,8 @@ static int http_fetch_base_and_csrf(const char *http_base, char **out_ws_url) {
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, &body);
     if (curl_easy_perform(easy) != CURLE_OK) { curl_easy_cleanup(easy); free(body.data); return -1; }
 
-    // cookies -> g_cookie
+    // cookies -> g_cookie (best-effort)
     if (build_cookie_header_from_curl(easy, g_cookie, sizeof(g_cookie)) != 0) {
-        // still continue; some setups may not need cookies
         g_cookie[0] = '\0';
     }
 
@@ -337,10 +330,11 @@ static int http_fetch_base_and_csrf(const char *http_base, char **out_ws_url) {
     }
     free(body.data);
 
-    // Build WS URL (with or without csrf)
+    // Build WS URL (with valid csrf or without)
     const char *ws_scheme = is_tls ? "wss" : "ws";
     char tmp[1024];
-    if (csrf && *csrf) {
+    int have_valid_csrf = (csrf && looks_like_csrf(csrf));
+    if (have_valid_csrf) {
         char *enc = curl_easy_escape(easy, csrf, 0);
         if (enc) {
             if ((is_tls && port == 443) || (!is_tls && port == 80))
@@ -350,10 +344,11 @@ static int http_fetch_base_and_csrf(const char *http_base, char **out_ws_url) {
                 snprintf(tmp, sizeof(tmp), "%s://%s:%d%s?vsn=%s&_csrf_token=%s",
                          ws_scheme, host, port, LIVE_WS_PATH, LIVE_VSN, enc);
             curl_free(enc);
+        } else {
+            have_valid_csrf = 0;
         }
-        free(csrf);
-    } else {
-        // Fallback: no CSRF param
+    }
+    if (!have_valid_csrf) {
         if ((is_tls && port == 443) || (!is_tls && port == 80))
             snprintf(tmp, sizeof(tmp), "%s://%s%s?vsn=%s",
                      ws_scheme, host, LIVE_WS_PATH, LIVE_VSN);
@@ -361,14 +356,15 @@ static int http_fetch_base_and_csrf(const char *http_base, char **out_ws_url) {
             snprintf(tmp, sizeof(tmp), "%s://%s:%d%s?vsn=%s",
                      ws_scheme, host, port, LIVE_WS_PATH, LIVE_VSN);
     }
+    if (csrf) free(csrf);
 
     curl_easy_cleanup(easy);
     *out_ws_url = strdup(tmp);
     return *out_ws_url ? 0 : -5;
 }
 
-// ===== Phoenix helpers =====
-static void ws_send(struct lws *wsi, const char *msg) {
+// ===== Phoenix + LWS helpers =====
+static void ws_send_lws(struct lws *wsi, const char *msg) {
     unsigned char buf[LWS_PRE + 1024];
     size_t len = strlen(msg);
     if (len > 1000) len = 1000;
@@ -380,14 +376,14 @@ static void send_join(struct lws *wsi, const char *topic) {
     char ref[32]; make_ref(ref, sizeof(ref));
     char msg[256];
     snprintf(msg, sizeof(msg), "[\"%s\",\"%s\",\"%s\",\"phx_join\",{}]", ref, ref, topic);
-    ws_send(wsi, msg);
+    ws_send_lws(wsi, msg);
 }
 
 static void send_heartbeat(struct lws *wsi) {
     char ref[32]; make_ref(ref, sizeof(ref));
     char msg[128];
     snprintf(msg, sizeof(msg), "[null,\"%s\",\"phoenix\",\"heartbeat\",{}]", ref);
-    ws_send(wsi, msg);
+    ws_send_lws(wsi, msg);
 }
 
 static int extract_lv_topic(const char *s, char *out, size_t outsz) {
@@ -535,7 +531,7 @@ static struct lws_protocols protocols[] = {
 };
 
 static void parse_ws_url(const char *url, char *host, int *port, char *path, size_t psz, int *is_tls) {
-    const char *p = strstr(url, "://"); 
+    const char *p = strstr(url, "://");
     *is_tls = 0;
     if (p) { if (!strncasecmp(url, "wss", 3)) *is_tls = 1; p += 3; } else p = url;
     const char *slash = strchr(p, '/');
@@ -565,7 +561,8 @@ int main(int argc, char **argv) {
         curl_global_cleanup();
         return 1;
     }
-    fprintf(stderr, "WS URL: %s\n", ws_url);
+    // Indicate whether CSRF param is present
+    fprintf(stderr, "WS URL: %s%s\n", ws_url, (strstr(ws_url, "_csrf_token=") ? "" : "  (no CSRF param)"));
     if (g_cookie[0]) fprintf(stderr, "Cookie: %s\n", g_cookie);
     if (g_origin[0]) fprintf(stderr, "Origin: %s\n", g_origin);
 
