@@ -1,5 +1,5 @@
 // sa_ws_profit.c
-// Browser-like: fetch cookies + CSRF + static assets, then connect Phoenix LiveView WS.
+// Browser-like LiveView client: gets cookies + session/static from HTML, connects WS, joins real lv topic with proper payload.
 // Publishes calculated profit to MQTT.
 //
 // Build (mac/Homebrew):
@@ -47,6 +47,10 @@ static unsigned long next_ref = 1;
 
 static char g_cookie[4096] = {0};
 static char g_origin[512]  = {0};
+static char g_csrf[512]    = {0};
+static char g_session[2048]= {0};
+static char g_static[1024] = {0};
+static char g_url[512]     = {0};  // normalized page URL we “visited”
 
 static void make_ref(char *out, size_t n) { snprintf(out, n, "%lu", next_ref++); }
 
@@ -82,6 +86,32 @@ static int parse_host_from_url(const char *base, char *host, size_t hostsz, int 
     return 0;
 }
 
+static int build_cookie_header_from_curl(CURL *easy, char *out, size_t outsz) {
+    struct curl_slist *cookies=NULL,*nc; CURLcode rc=curl_easy_getinfo(easy,CURLINFO_COOKIELIST,&cookies);
+    if(rc!=CURLE_OK||!cookies) return -1; size_t used=0;
+    for(nc=cookies;nc;nc=nc->next){ const char *line=nc->data; int tabs=0; const char *p=line,*name=NULL,*val=NULL;
+        while(*p){ if(*p=='\t'){ tabs++; if(tabs==5) name=p+1; if(tabs==6){ val=p+1; break; } } p++; }
+        if(!name||!val) continue; const char *name_end=strchr(name,'\t'); if(!name_end) continue;
+        const char *val_end=strchr(val,'\t'); if(!val_end) val_end=line+strlen(line);
+        size_t nlen=(size_t)(name_end-name), vlen=(size_t)(val_end-val);
+        if(used+nlen+1+vlen+2>=outsz) break; if(used) out[used++]=' ';
+        memcpy(out+used,name,nlen); used+=nlen; out[used++]='='; memcpy(out+used,val,vlen); used+=vlen; out[used++]=';';
+    }
+    if(used&&out[used-1]==';') used--; out[used]=0; curl_slist_free_all(cookies); return used?0:-1;
+}
+
+static char *extract_attr(const char *html, const char *attr_name) {
+    // finds attr like data-phx-session="..."; returns malloc'd value (caller frees) or NULL
+    const char *p = html;
+    while ((p = strcasestr_fast(p, attr_name)) != NULL) {
+        const char *q = strchr(p, '"'); if(!q){p++;continue;}
+        const char *r = strchr(q+1, '"'); if(!r){p++;continue;}
+        size_t n=(size_t)(r-(q+1)); if(n>0 && n<4096){ char *out=(char*)malloc(n+1); if(!out) return NULL; memcpy(out,q+1,n); out[n]=0; return out; }
+        p = r ? r+1 : p+1;
+    }
+    return NULL;
+}
+
 static char *extract_csrf_from_meta(const char *html) {
     const char *m = html;
     while ((m = strcasestr_fast(m, "<meta")) != NULL) {
@@ -114,20 +144,6 @@ static char *extract_csrf_from_text_generic(const char *s) {
     return NULL;
 }
 
-static int build_cookie_header_from_curl(CURL *easy, char *out, size_t outsz) {
-    struct curl_slist *cookies=NULL,*nc; CURLcode rc=curl_easy_getinfo(easy,CURLINFO_COOKIELIST,&cookies);
-    if(rc!=CURLE_OK||!cookies) return -1; size_t used=0;
-    for(nc=cookies;nc;nc=nc->next){ const char *line=nc->data; int tabs=0; const char *p=line,*name=NULL,*val=NULL;
-        while(*p){ if(*p=='\t'){ tabs++; if(tabs==5) name=p+1; if(tabs==6){ val=p+1; break; } } p++; }
-        if(!name||!val) continue; const char *name_end=strchr(name,'\t'); if(!name_end) continue;
-        const char *val_end=strchr(val,'\t'); if(!val_end) val_end=line+strlen(line);
-        size_t nlen=(size_t)(name_end-name), vlen=(size_t)(val_end-val);
-        if(used+nlen+1+vlen+2>=outsz) break; if(used) out[used++]=' ';
-        memcpy(out+used,name,nlen); used+=nlen; out[used++]='='; memcpy(out+used,val,vlen); used+=vlen; out[used++]=';';
-    }
-    if(used&&out[used-1]==';') used--; out[used]=0; curl_slist_free_all(cookies); return used?0:-1;
-}
-
 static int absolute_url(char *dst, size_t dsz, const char *base, const char *src) {
     if (starts_with(src,"http://")||starts_with(src,"https://")) { snprintf(dst, dsz, "%s", src); return 0; }
     char host[256]; int port=80,tls=0; parse_host_from_url(base,host,sizeof(host),&port,&tls);
@@ -142,9 +158,8 @@ static int absolute_url(char *dst, size_t dsz, const char *base, const char *src
     return 0;
 }
 
-static void collect_script_and_css_srcs(const char *html, const char *base, char list[][512], int *count, int max_items) {
+static void collect_static_srcs(const char *html, const char *base, char list[][512], int *count, int max_items) {
     *count=0; const char *p=html;
-    // <script src="...">
     while ((p=strcasestr_fast(p,"<script"))!=NULL) {
         const char *s=strcasestr_fast(p,"src="); if(!s){p++;continue;}
         const char *q1=strchr(s,'"'); if(!q1){p++;continue;}
@@ -153,7 +168,6 @@ static void collect_script_and_css_srcs(const char *html, const char *base, char
             if(*count<max_items){ snprintf(list[*count],512,"%s",abs); (*count)++; } }
         p=q2+1; if(*count>=max_items) break;
     }
-    // <link rel="stylesheet" href="...">
     p=html;
     while ((p=strcasestr_fast(p,"<link"))!=NULL) {
         const char *rel=strcasestr_fast(p,"rel="); if(!rel){p++;continue;}
@@ -178,7 +192,7 @@ static int http_fetch_with_handle(CURL *easy, const char *url, struct mem *out) 
     return rc == CURLE_OK ? 0 : -1;
 }
 
-static int http_fetch_base_and_build_ws_url(const char *http_base, char **out_ws_url) {
+static int http_boot_and_build_ws(const char *http_base, char **out_ws_url) {
     *out_ws_url = NULL;
     CURL *easy = curl_easy_init(); if(!easy) return -1;
 
@@ -193,25 +207,33 @@ static int http_fetch_base_and_build_ws_url(const char *http_base, char **out_ws
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, &body);
     if (curl_easy_perform(easy) != CURLE_OK) { curl_easy_cleanup(easy); free(body.data); return -1; }
 
-    // cookies -> g_cookie (best-effort)
+    // Cookie header
     if (build_cookie_header_from_curl(easy, g_cookie, sizeof(g_cookie)) != 0) g_cookie[0] = '\0';
 
-    // Origin from base
-    char host[256]; int port = 80, is_tls = 0;
+    // Origin + g_url normalized to base
+    char host[256]; int port=80, is_tls=0;
     parse_host_from_url(http_base, host, sizeof(host), &port, &is_tls);
-    if ((is_tls && port == 443) || (!is_tls && port == 80))
+    if ((is_tls && port == 443) || (!is_tls && port == 80)) {
         snprintf(g_origin, sizeof(g_origin), "%s://%s", is_tls ? "https" : "http", host);
-    else
+        snprintf(g_url, sizeof(g_url), "%s://%s/", is_tls ? "https" : "http", host);
+    } else {
         snprintf(g_origin, sizeof(g_origin), "%s://%s:%d", is_tls ? "https" : "http", host, port);
+        snprintf(g_url, sizeof(g_url), "%s://%s:%d/", is_tls ? "https" : "http", host, port);
+    }
 
-    // CSRF candidates
+    // Grab session/static from the LiveView root (e.g. <main id="phx-..." data-phx-session="..." data-phx-static="...">)
+    char *sess = extract_attr(body.data, "data-phx-session=");
+    char *sttc = extract_attr(body.data, "data-phx-static=");
+    if (sess) { snprintf(g_session, sizeof(g_session), "%s", sess); free(sess); }
+    if (sttc) { snprintf(g_static,  sizeof(g_static),  "%s", sttc); free(sttc); }
+
+    // CSRF: meta first, else in JS
     char *csrf = extract_csrf_from_meta(body.data ? body.data : "");
 
-    // collect static assets for _track_static[]
-    char assets[16][512]; int ac = 0;
-    collect_script_and_css_srcs(body.data ? body.data : "", http_base, assets, &ac, 16);
+    // _track_static
+    char assets[16][512]; int ac=0;
+    collect_static_srcs(body.data ? body.data : "", http_base, assets, &ac, 16);
 
-    // If CSRF not found in meta, scan first few JS assets for _csrf_token
     if (!csrf) {
         for (int i=0; i<ac && i<10 && !csrf; i++) {
             struct mem js = {0};
@@ -221,29 +243,24 @@ static int http_fetch_base_and_build_ws_url(const char *http_base, char **out_ws
             free(js.data);
         }
     }
-
+    if (csrf && looks_like_csrf(csrf)) snprintf(g_csrf, sizeof(g_csrf), "%s", csrf);
+    if (csrf) free(csrf);
     free(body.data);
 
     // Build WS URL
     const char *ws_scheme = is_tls ? "wss" : "ws";
     char query[2048]; size_t qlen = 0;
-    // vsn
     qlen += snprintf(query+qlen, sizeof(query)-qlen, "vsn=%s", LIVE_VSN);
-    // csrf (only if valid)
-    int have_valid_csrf = (csrf && looks_like_csrf(csrf));
-    if (have_valid_csrf) {
-        char *enc = curl_easy_escape(easy, csrf, 0);
+    if (g_csrf[0]) {
+        char *enc = curl_easy_escape(easy, g_csrf, 0);
         if (enc) { qlen += snprintf(query+qlen, sizeof(query)-qlen, "&_csrf_token=%s", enc); curl_free(enc); }
-        else have_valid_csrf = 0;
     }
-    // _track_static[]
     for (int i=0; i<ac && qlen < sizeof(query)-32; i++) {
         char *enc = curl_easy_escape(easy, assets[i], 0);
         if (!enc) continue;
         qlen += snprintf(query+qlen, sizeof(query)-qlen, "&_track_static%%5B%d%%5D=%s", i, enc);
         curl_free(enc);
     }
-    // mounts + referer
     qlen += snprintf(query+qlen, sizeof(query)-qlen, "&_mounts=0&_live_referer=undefined");
 
     char ws_url[2048];
@@ -252,32 +269,45 @@ static int http_fetch_base_and_build_ws_url(const char *http_base, char **out_ws
     else
         snprintf(ws_url, sizeof(ws_url), "%s://%s:%d%s?%s", ws_scheme, host, port, LIVE_WS_PATH, query);
 
-    if (csrf) free(csrf);
     curl_easy_cleanup(easy);
-
     *out_ws_url = strdup(ws_url);
     return *out_ws_url ? 0 : -5;
 }
 
-// ---------- Phoenix + LWS ----------
+// ------ Phoenix / LWS ------
 static void ws_send_lws(struct lws *wsi, const char *msg) {
-    unsigned char buf[LWS_PRE + 1024];
-    size_t len = strlen(msg); if (len > 1000) len = 1000;
+    unsigned char buf[LWS_PRE + 2048];
+    size_t len = strlen(msg); if (len > 2000) len = 2000;
     memcpy(&buf[LWS_PRE], msg, len);
     lws_write(wsi, &buf[LWS_PRE], len, LWS_WRITE_TEXT);
 }
-static void send_join(struct lws *wsi, const char *topic) {
-    char ref[32]; make_ref(ref, sizeof(ref));
-    char msg[256];
-    snprintf(msg, sizeof(msg), "[\"%s\",\"%s\",\"%s\",\"phx_join\",{}]", ref, ref, topic);
-    ws_send_lws(wsi, msg);
-}
+
 static void send_heartbeat(struct lws *wsi) {
     char ref[32]; make_ref(ref, sizeof(ref));
     char msg[128];
     snprintf(msg, sizeof(msg), "[null,\"%s\",\"phoenix\",\"heartbeat\",{}]", ref);
     ws_send_lws(wsi, msg);
 }
+
+static void send_join_payload(struct lws *wsi, const char *topic) {
+    // Build a LiveView-style join payload:
+    // {"url": g_url, "params":{"_csrf_token":g_csrf(optional), "_mounts":0}, "session": g_session(optional), "static": g_static(optional)}
+    char payload[1536]; size_t L = 0;
+    L += snprintf(payload+L, sizeof(payload)-L, "{\"url\":\"%s\",\"params\":{", g_url[0]?g_url:"/" );
+    int first = 1;
+    if (g_csrf[0]) { L += snprintf(payload+L, sizeof(payload)-L, "\"_csrf_token\":\"%s\"", g_csrf); first=0; }
+    L += snprintf(payload+L, sizeof(payload)-L, "%s\"_mounts\":0},", first? "" : ",");
+    if (g_session[0]) L += snprintf(payload+L, sizeof(payload)-L, "\"session\":\"%s\",", g_session);
+    if (g_static[0])  L += snprintf(payload+L, sizeof(payload)-L, "\"static\":\"%s\",",  g_static);
+    if (payload[L-1] == ',') payload[--L] = 0; // trim trailing comma
+    L += snprintf(payload+L, sizeof(payload)-L, "}");
+
+    char ref[32]; make_ref(ref, sizeof(ref));
+    char frame[2048];
+    snprintf(frame, sizeof(frame), "[\"%s\",\"%s\",\"%s\",\"phx_join\",%s]", ref, ref, topic, payload);
+    ws_send_lws(wsi, frame);
+}
+
 static int extract_lv_topic(const char *s, char *out, size_t outsz) {
     const char *p = strstr(s, "lv:phx-"); if (!p) return 0;
     const char *e = strchr(p, '"'); if (!e) return 0;
@@ -285,18 +315,18 @@ static int extract_lv_topic(const char *s, char *out, size_t outsz) {
     strncpy(out, p, n); out[n] = 0;
     return strcmp(out, "lv:phx-0") != 0;
 }
-// first daily row: "d":[[ ... ]] -> cols 5 (used) and 6 (export)
+
 static void parse_daily_first_row_for_used_exp(const char *s) {
     const char *d = strstr(s, "\"d\":[["); if (!d) return; d += 5;
     const char *row = strchr(d, '['); if (!row) return;
     int depth = 0; const char *p = row;
-    while (*p) { if (*p=='[') depth++; else if (*p==']'){ depth--; if(depth==0){ p++; break; } } p++; if (p-row>2000) break; }
+    while (*p) { if (*p=='[') depth++; else if (*p==']'){ depth--; if(depth==0){ p++; break; } } p++; if (p-row>3000) break; }
     if (depth != 0) return;
-    char buf[1200]; size_t n=(size_t)(p-row); if(n>=sizeof(buf)) n=sizeof(buf)-1; memcpy(buf,row,n); buf[n]=0;
+    char buf[1600]; size_t n=(size_t)(p-row); if(n>=sizeof(buf)) n=sizeof(buf)-1; memcpy(buf,row,n); buf[n]=0;
     int col=0; char *save=NULL; char *tok=strtok_r(buf,",",&save);
     while (tok) {
         while (*tok==' '||*tok=='['||*tok=='\"') tok++;
-        size_t L=strlen(tok); while(L && (tok[L-1]==' '||tok[L-1]==']'||tok[L-1]=='\"')) tok[--L]=0;
+        size_t TL=strlen(tok); while(TL && (tok[TL-1]==' '||tok[TL-1]==']'||tok[TL-1]=='\"')) tok[--TL]=0;
         if (col==5) grid_used=atof(tok); else if (col==6) grid_exp=atof(tok);
         if (grid_used>=0.0 && grid_exp>=0.0) break;
         col++; tok=strtok_r(NULL,",",&save);
@@ -308,8 +338,8 @@ static int cb(struct lws *wsi, enum lws_callback_reasons reason, void *user, voi
     switch (reason) {
         case LWS_CALLBACK_CLIENT_ESTABLISHED:
             last_hb = time(NULL);
-            // Bootstrap join on dummy; some servers reply "stale" and then emit the real topic
-            send_join(wsi, "lv:phx-0");
+            // Kick off heartbeat loop; server will soon hint the real topic in its pushes
+            // (We don't send any join yet here — only after we learn the topic)
             break;
 
         case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER: {
@@ -334,12 +364,12 @@ static int cb(struct lws *wsi, enum lws_callback_reasons reason, void *user, voi
             char msg[8192]; size_t ncopy = len < sizeof(msg)-1 ? len : sizeof(msg)-1;
             memcpy(msg, in, ncopy); msg[ncopy] = 0;
 
-            // if server hints the real LV topic, join it
+            // learn & join the real LiveView topic once
             if (!joined) {
                 char tmp[128];
                 if (extract_lv_topic(msg, tmp, sizeof(tmp))) {
                     strncpy(lv_topic, tmp, sizeof(lv_topic)-1); lv_topic[sizeof(lv_topic)-1]=0;
-                    send_join(wsi, lv_topic);
+                    send_join_payload(wsi, lv_topic);
                     joined = 1;
                     last_hb = time(NULL);
                 }
@@ -390,15 +420,17 @@ int main(int argc, char **argv) {
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    // Build LiveView-style WS URL (with cookies, csrf if valid, _track_static[], mounts, referer)
+    // Build WS URL and collect cookies/csrf/session/static/url
     char *ws_url = NULL;
-    if (http_fetch_base_and_build_ws_url(http_base, &ws_url) != 0 || !ws_url) {
+    if (http_boot_and_build_ws(http_base, &ws_url) != 0 || !ws_url) {
         fprintf(stderr, "Failed to prepare WS URL from %s\n", http_base);
         curl_global_cleanup(); return 1;
     }
     fprintf(stderr, "WS URL: %s\n", ws_url);
     if (g_cookie[0]) fprintf(stderr, "Cookie: %s\n", g_cookie);
     if (g_origin[0]) fprintf(stderr, "Origin: %s\n", g_origin);
+    if (g_session[0]) fprintf(stderr, "session: %.32s...\n", g_session);
+    if (g_static[0])  fprintf(stderr, "static:  %.32s...\n", g_static);
 
     // MQTT connect
     MQTTClient_connectOptions opts = MQTTClient_connectOptions_initializer;
