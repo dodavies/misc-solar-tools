@@ -1,483 +1,232 @@
 // sa_ws_profit.c
-// Browser-like LiveView client: gets cookies + session/static from HTML, connects WS, joins real lv topic with proper payload.
-// Publishes calculated profit to MQTT.
+// Simple scraper: fetch the SolarAssistant page HTML, extract today's Grid Used & Grid Export,
+// compute profit, publish to MQTT. No websockets. No cookies. No DevTools.
 //
 // Build (mac/Homebrew):
 //   gcc -std=c11 -O2 -o sa_ws_profit sa_ws_profit.c \
-//     $(pkg-config --cflags libwebsockets libcurl openssl) \
+//     $(pkg-config --cflags libcurl openssl) \
 //     -lpaho-mqtt3c \
-//     $(pkg-config --libs libwebsockets libcurl openssl) \
+//     $(pkg-config --libs libcurl openssl) \
 //     -lpthread -Wl,-rpath,/opt/homebrew/lib
 //
 // Run:
-//   ./sa_ws_profit               # defaults to http://192.168.0.177
-//   ./sa_ws_profit http://192.168.0.177
+//   ./sa_ws_profit                       # defaults to http://192.168.0.177
+//   ./sa_ws_profit http://192.168.0.177  # or pass explicit URL
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <libwebsockets.h>
-#include "MQTTClient.h"
-#include <time.h>
-#include <curl/curl.h>
 #include <ctype.h>
+#include <curl/curl.h>
+#include "MQTTClient.h"
 
+// ====== CONFIG ======
+#define DEFAULT_HTTP_URL "http://192.168.0.177"   // page that shows the numbers
 #define MQTT_HOST     "tcp://192.168.0.160:1883"
 #define MQTT_CLIENTID "sa-profit-publisher"
 #define MQTT_USER     "mqttuser"
 #define MQTT_PASS     "mqttuser"
 #define MQTT_TOPIC    "home/solar/profit"
 
-#define IMPORT_TARIFF 0.07
-#define EXPORT_TARIFF 0.15
-#define TIMEOUT_SEC   60
+#define IMPORT_TARIFF 0.07   // £/kWh
+#define EXPORT_TARIFF 0.15   // £/kWh
+// =====================
 
-#define DEFAULT_HTTP_BASE "http://192.168.0.177"
-#define LIVE_WS_PATH      "/live/websocket"
-#define LIVE_VSN          "2.0.0"
-
-static int done = 0;
-static int joined = 0;
-static double grid_used = -1.0, grid_exp = -1.0;
-static char lv_topic[128] = {0};
-static time_t start_ts = 0, last_hb = 0;
-static MQTTClient mqtt;
-static unsigned long next_ref = 1;
-
-static char g_cookie[4096] = {0};
-static char g_origin[512]  = {0};
-static char g_csrf[512]    = {0};
-static char g_session[2048]= {0};
-static char g_static[1024] = {0};
-static char g_url[512]     = {0};  // normalized page URL we “visited”
-
-static void make_ref(char *out, size_t n) { snprintf(out, n, "%lu", next_ref++); }
+struct mem { char *data; size_t len; };
+static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    size_t cnt = size * nmemb;
+    struct mem *m = (struct mem *)userdata;
+    char *p = (char *)realloc(m->data, m->len + cnt + 1);
+    if (!p) return 0;
+    m->data = p;
+    memcpy(m->data + m->len, ptr, cnt);
+    m->len += cnt;
+    m->data[m->len] = 0;
+    return cnt;
+}
 
 static char *strcasestr_fast(const char *h, const char *n) {
     if (!*n) return (char*)h;
     size_t nl = strlen(n);
-    for (const char *p = h; *p; p++) if (tolower((unsigned char)*p) == tolower((unsigned char)*n))
-        if (strncasecmp(p, n, nl) == 0) return (char*)p;
-    return NULL;
-}
-static int starts_with(const char *s, const char *pfx) { return strncmp(s, pfx, strlen(pfx)) == 0; }
-static int looks_like_csrf(const char *s) {
-    if (!s) return 0; size_t n = strlen(s); if (n < 16 || n > 256) return 0;
-    for (size_t i=0;i<n;i++){ unsigned char c=s[i];
-        if(!(isalnum(c)||c=='_'||c=='-'||c=='+'||c=='/'||c=='=')) return 0; }
-    return 1;
-}
-
-struct mem { char *data; size_t len; };
-static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
-    size_t cnt = size*nmemb; struct mem *m=(struct mem*)userdata;
-    char *p=(char*)realloc(m->data, m->len+cnt+1); if(!p) return 0;
-    m->data=p; memcpy(m->data+m->len,ptr,cnt); m->len+=cnt; m->data[m->len]=0; return cnt;
-}
-
-static int parse_host_from_url(const char *base, char *host, size_t hostsz, int *port, int *is_tls) {
-    const char *p = strstr(base, "://"); *is_tls = 0;
-    if (p) { if (!strncasecmp(base, "https", 5)) *is_tls = 1; p += 3; } else { p = base; }
-    const char *slash = strchr(p, '/'); const char *colon = strchr(p, ':');
-    if (slash && colon && colon < slash) {
-        size_t hlen=(size_t)(colon-p); if(hlen>=hostsz) hlen=hostsz-1; memcpy(host,p,hlen); host[hlen]=0; *port=atoi(colon+1);
-    } else { size_t hlen= slash? (size_t)(slash-p) : strlen(p); if(hlen>=hostsz) hlen=hostsz-1; memcpy(host,p,hlen); host[hlen]=0; *port=*is_tls?443:80; }
-    return 0;
-}
-
-static int build_cookie_header_from_curl(CURL *easy, char *out, size_t outsz) {
-    struct curl_slist *cookies=NULL,*nc; CURLcode rc=curl_easy_getinfo(easy,CURLINFO_COOKIELIST,&cookies);
-    if(rc!=CURLE_OK||!cookies) return -1; size_t used=0;
-    for(nc=cookies;nc;nc=nc->next){ const char *line=nc->data; int tabs=0; const char *p=line,*name=NULL,*val=NULL;
-        while(*p){ if(*p=='\t'){ tabs++; if(tabs==5) name=p+1; if(tabs==6){ val=p+1; break; } } p++; }
-        if(!name||!val) continue; const char *name_end=strchr(name,'\t'); if(!name_end) continue;
-        const char *val_end=strchr(val,'\t'); if(!val_end) val_end=line+strlen(line);
-        size_t nlen=(size_t)(name_end-name), vlen=(size_t)(val_end-val);
-        if(used+nlen+1+vlen+2>=outsz) break; if(used) out[used++]=' ';
-        memcpy(out+used,name,nlen); used+=nlen; out[used++]='='; memcpy(out+used,val,vlen); used+=vlen; out[used++]=';';
-    }
-    if(used&&out[used-1]==';') used--; out[used]=0; curl_slist_free_all(cookies); return used?0:-1;
-}
-
-static char *extract_attr(const char *html, const char *attr_name) {
-    // finds attr like data-phx-session="..."; returns malloc'd value (caller frees) or NULL
-    const char *p = html;
-    while ((p = strcasestr_fast(p, attr_name)) != NULL) {
-        const char *q = strchr(p, '"'); if(!q){p++;continue;}
-        const char *r = strchr(q+1, '"'); if(!r){p++;continue;}
-        size_t n=(size_t)(r-(q+1)); if(n>0 && n<4096){ char *out=(char*)malloc(n+1); if(!out) return NULL; memcpy(out,q+1,n); out[n]=0; return out; }
-        p = r ? r+1 : p+1;
-    }
-    return NULL;
-}
-
-static char *extract_csrf_from_meta(const char *html) {
-    const char *m = html;
-    while ((m = strcasestr_fast(m, "<meta")) != NULL) {
-        const char *name = strcasestr_fast(m, "name="); if(!name){m++;continue;}
-        const char *q1=strchr(name,'"'); if(!q1){m++;continue;}
-        const char *q2=strchr(q1+1,'"'); if(!q2){m++;continue;}
-        if (strncasecmp(q1+1,"csrf-token",(size_t)(q2-(q1+1)))==0) {
-            const char *cont=strcasestr_fast(q2,"content="); if(!cont){m++;continue;}
-            const char *c1=strchr(cont,'"'); if(!c1){m++;continue;}
-            const char *c2=strchr(c1+1,'"'); if(!c2){m++;continue;}
-            size_t n=(size_t)(c2-(c1+1)); char *out=(char*)malloc(n+1); if(!out) return NULL;
-            memcpy(out,c1+1,n); out[n]=0; return out;
+    for (const char *p = h; *p; p++) {
+        if (tolower((unsigned char)*p) == tolower((unsigned char)*n)) {
+            if (strncasecmp(p, n, nl) == 0) return (char*)p;
         }
-        m++;
     }
     return NULL;
 }
 
-static char *extract_csrf_from_text_generic(const char *s) {
-    const char *p=s;
-    while((p=strcasestr_fast(p,"_csrf_token"))!=NULL){
-        const char *colon=strchr(p,':'); if(!colon){p++;continue;}
-        const char *q=colon+1; while(*q && isspace((unsigned char)*q)) q++;
-        if(*q!='"' && *q!='\''){p++;continue;} char quote=*q++;
-        const char *end=strchr(q,quote); if(!end){p++;continue;}
-        size_t n=(size_t)(end-q); if(n>=16&&n<256){ char *out=(char*)malloc(n+1); if(!out) return NULL;
-            memcpy(out,q,n); out[n]=0; if(looks_like_csrf(out)) return out; free(out); }
-        p=end+1;
-    }
-    return NULL;
-}
-
-static int absolute_url(char *dst, size_t dsz, const char *base, const char *src) {
-    if (starts_with(src,"http://")||starts_with(src,"https://")) { snprintf(dst, dsz, "%s", src); return 0; }
-    char host[256]; int port=80,tls=0; parse_host_from_url(base,host,sizeof(host),&port,&tls);
-    const char *scheme=tls?"https":"http";
-    if(*src=='/') {
-        if((tls&&port==443)||(!tls&&port==80)) snprintf(dst,dsz,"%s://%s%s",scheme,host,src);
-        else snprintf(dst,dsz,"%s://%s:%d%s",scheme,host,port,src);
-    } else {
-        if((tls&&port==443)||(!tls&&port==80)) snprintf(dst,dsz,"%s://%s/%s",scheme,host,src);
-        else snprintf(dst,dsz,"%s://%s:%d/%s",scheme,host,port,src);
+// Parse a double from s[start..end) moving leftwards/rightwards to capture "123.45"
+static int parse_number_near(const char *s, size_t start, size_t end, double *out) {
+    // Expand around 'start' to find a number
+    size_t i = start, j = start;
+    while (i > 0 && (isdigit((unsigned char)s[i-1]) || s[i-1]=='.')) i--;
+    while (j < end && (isdigit((unsigned char)s[j]) || s[j]=='.')) j++;
+    if (j > i) {
+        char buf[64];
+        size_t n = j - i; if (n >= sizeof(buf)) n = sizeof(buf)-1;
+        memcpy(buf, s+i, n); buf[n]=0;
+        *out = atof(buf);
+        return 1;
     }
     return 0;
 }
 
-static void collect_static_srcs(const char *html, const char *base, char list[][512], int *count, int max_items) {
-    *count=0; const char *p=html;
-    while ((p=strcasestr_fast(p,"<script"))!=NULL) {
-        const char *s=strcasestr_fast(p,"src="); if(!s){p++;continue;}
-        const char *q1=strchr(s,'"'); if(!q1){p++;continue;}
-        const char *q2=strchr(q1+1,'"'); if(!q2){p++;continue;}
-        size_t n=(size_t)(q2-(q1+1)); if(n>0&&n<480){ char rel[512]; memcpy(rel,q1+1,n); rel[n]=0; char abs[512]; absolute_url(abs,sizeof(abs),base,rel);
-            if(*count<max_items){ snprintf(list[*count],512,"%s",abs); (*count)++; } }
-        p=q2+1; if(*count>=max_items) break;
+// Strategy A: look for chart-like JSON "d":[[ ... ]], pick columns 5 & 6 (0-based)
+static int try_extract_from_chart_json(const char *html, double *used, double *exp) {
+    const char *d = strstr(html, "\"d\":[[");
+    if (!d) return 0;
+    d += 5;
+    const char *row = strchr(d, '[');
+    if (!row) return 0;
+    int depth = 0; const char *p = row;
+    while (*p) {
+        if (*p=='[') depth++;
+        else if (*p==']') { depth--; if (depth==0) { p++; break; } }
+        p++;
+        if (p - row > 4000) break;
     }
-    p=html;
-    while ((p=strcasestr_fast(p,"<link"))!=NULL) {
-        const char *rel=strcasestr_fast(p,"rel="); if(!rel){p++;continue;}
-        const char *rq1=strchr(rel,'"'); if(!rq1){p++;continue;}
-        const char *rq2=strchr(rq1+1,'"'); if(!rq2){p++;continue;}
-        if (strncasecmp(rq1+1,"stylesheet",(size_t)(rq2-(rq1+1)))!=0) { p++; continue; }
-        const char *h=strcasestr_fast(p,"href="); if(!h){p++;continue;}
-        const char *hq1=strchr(h,'"'); if(!hq1){p++;continue;}
-        const char *hq2=strchr(hq1+1,'"'); if(!hq2){p++;continue;}
-        size_t n=(size_t)(hq2-(hq1+1)); if(n>0&&n<480){ char relp[512]; memcpy(relp,hq1+1,n); relp[n]=0; char abs[512]; absolute_url(abs,sizeof(abs),base,relp);
-            if(*count<max_items){ snprintf(list[*count],512,"%s",abs); (*count)++; } }
-        p=hq2+1; if(*count>=max_items) break;
+    if (depth != 0) return 0;
+
+    char buf[3000];
+    size_t n = (size_t)(p - row);
+    if (n >= sizeof(buf)) n = sizeof(buf)-1;
+    memcpy(buf, row, n); buf[n] = 0;
+
+    int col = 0;
+    char *save = NULL;
+    char *tok = strtok_r(buf, ",", &save);
+    double u = -1, e = -1;
+    while (tok) {
+        while (*tok==' '||*tok=='['||*tok=='\"') tok++;
+        size_t L = strlen(tok);
+        while (L && (tok[L-1]==' '||tok[L-1]==']'||tok[L-1]=='\"')) tok[--L]=0;
+        if (col==5) u = atof(tok);
+        else if (col==6) e = atof(tok);
+        if (u>=0 && e>=0) break;
+        col++;
+        tok = strtok_r(NULL, ",", &save);
     }
+    if (u>=0 && e>=0) { *used=u; *exp=e; return 1; }
+    return 0;
 }
 
-static int http_fetch_with_handle(CURL *easy, const char *url, struct mem *out) {
-    curl_easy_setopt(easy, CURLOPT_URL, url);
-    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(easy, CURLOPT_WRITEDATA, out);
-    CURLcode rc = curl_easy_perform(easy);
+// Strategy B: scan for "Used" / "Export" (or "Grid Used"/"Grid Export") near numbers with "kWh"
+static int find_kwh_after_label(const char *html, const char *label, double *val_out) {
+    const char *p = html;
+    while ((p = strcasestr_fast(p, label)) != NULL) {
+        // Search forward a small window for a number followed by "kWh"
+        const size_t WIN = 350;
+        const char *q = p;
+        const char *end = p + WIN;
+        // find "kWh"
+        const char *kwh = strcasestr_fast(q, "kwh");
+        if (kwh && kwh < end) {
+            // parse number immediately before kWh
+            double v;
+            size_t start = (kwh - html);
+            if (parse_number_near(html, start, start, &v)) {
+                *val_out = v;
+                return 1;
+            }
+        }
+        // Alternative: number then "kWh" later in window
+        for (const char *r = q; r < end && *r; r++) {
+            if (isdigit((unsigned char)*r)) {
+                double v;
+                if (parse_number_near(html, (size_t)(r - html), (size_t)(end - html), &v)) {
+                    const char *after = r;
+                    const char *k2 = strcasestr_fast(after, "kwh");
+                    if (k2 && k2 < end) { *val_out = v; return 1; }
+                }
+            }
+        }
+        p = p + strlen(label);
+    }
+    return 0;
+}
+
+// Strategy C: look for table headers "Used" / "Export" and numbers in same row
+static int try_extract_from_table_headers(const char *html, double *used, double *exp) {
+    double u=-1, e=-1;
+    int fu = find_kwh_after_label(html, "Grid Used", &u) || find_kwh_after_label(html, "Used", &u);
+    int fe = find_kwh_after_label(html, "Grid Export", &e) || find_kwh_after_label(html, "Export", &e);
+    if (fu && fe) { *used=u; *exp=e; return 1; }
+    return 0;
+}
+
+static int http_get(const char *url, struct mem *out) {
+    CURL *c = curl_easy_init();
+    if (!c) return -1;
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "Mozilla/5.0");
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, out);
+    CURLcode rc = curl_easy_perform(c);
+    curl_easy_cleanup(c);
     return rc == CURLE_OK ? 0 : -1;
 }
 
-static int http_boot_and_build_ws(const char *http_base, char **out_ws_url) {
-    *out_ws_url = NULL;
-    CURL *easy = curl_easy_init(); if(!easy) return -1;
-
-    curl_easy_setopt(easy, CURLOPT_COOKIEFILE, "");
-    curl_easy_setopt(easy, CURLOPT_USERAGENT, "Mozilla/5.0");
-    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
-
-    // GET base page
-    struct mem body = {0};
-    curl_easy_setopt(easy, CURLOPT_URL, http_base);
-    curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(easy, CURLOPT_WRITEDATA, &body);
-    if (curl_easy_perform(easy) != CURLE_OK) { curl_easy_cleanup(easy); free(body.data); return -1; }
-
-    // Cookie header
-    if (build_cookie_header_from_curl(easy, g_cookie, sizeof(g_cookie)) != 0) g_cookie[0] = '\0';
-
-    // Origin + g_url normalized to base
-    char host[256]; int port=80, is_tls=0;
-    parse_host_from_url(http_base, host, sizeof(host), &port, &is_tls);
-    if ((is_tls && port == 443) || (!is_tls && port == 80)) {
-        snprintf(g_origin, sizeof(g_origin), "%s://%s", is_tls ? "https" : "http", host);
-        snprintf(g_url, sizeof(g_url), "%s://%s/", is_tls ? "https" : "http", host);
-    } else {
-        snprintf(g_origin, sizeof(g_origin), "%s://%s:%d", is_tls ? "https" : "http", host, port);
-        snprintf(g_url, sizeof(g_url), "%s://%s:%d/", is_tls ? "https" : "http", host, port);
-    }
-
-    // Grab session/static from the LiveView root (e.g. <main id="phx-..." data-phx-session="..." data-phx-static="...">)
-    char *sess = extract_attr(body.data, "data-phx-session=");
-    char *sttc = extract_attr(body.data, "data-phx-static=");
-    if (sess) { snprintf(g_session, sizeof(g_session), "%s", sess); free(sess); }
-    if (sttc) { snprintf(g_static,  sizeof(g_static),  "%s", sttc); free(sttc); }
-
-    // CSRF: meta first, else in JS
-    char *csrf = extract_csrf_from_meta(body.data ? body.data : "");
-
-    // _track_static
-    char assets[16][512]; int ac=0;
-    collect_static_srcs(body.data ? body.data : "", http_base, assets, &ac, 16);
-
-    if (!csrf) {
-        for (int i=0; i<ac && i<10 && !csrf; i++) {
-            struct mem js = {0};
-            if (http_fetch_with_handle(easy, assets[i], &js) == 0) {
-                csrf = extract_csrf_from_text_generic(js.data ? js.data : "");
-            }
-            free(js.data);
-        }
-    }
-    if (csrf && looks_like_csrf(csrf)) snprintf(g_csrf, sizeof(g_csrf), "%s", csrf);
-    if (csrf) free(csrf);
-    free(body.data);
-
-    // Build WS URL
-    const char *ws_scheme = is_tls ? "wss" : "ws";
-    char query[2048]; size_t qlen = 0;
-    qlen += snprintf(query+qlen, sizeof(query)-qlen, "vsn=%s", LIVE_VSN);
-    if (g_csrf[0]) {
-        char *enc = curl_easy_escape(easy, g_csrf, 0);
-        if (enc) { qlen += snprintf(query+qlen, sizeof(query)-qlen, "&_csrf_token=%s", enc); curl_free(enc); }
-    }
-    for (int i=0; i<ac && qlen < sizeof(query)-32; i++) {
-        char *enc = curl_easy_escape(easy, assets[i], 0);
-        if (!enc) continue;
-        qlen += snprintf(query+qlen, sizeof(query)-qlen, "&_track_static%%5B%d%%5D=%s", i, enc);
-        curl_free(enc);
-    }
-    qlen += snprintf(query+qlen, sizeof(query)-qlen, "&_mounts=0&_live_referer=undefined");
-
-    char ws_url[2048];
-    if ((is_tls && port == 443) || (!is_tls && port == 80))
-        snprintf(ws_url, sizeof(ws_url), "%s://%s%s?%s", ws_scheme, host, LIVE_WS_PATH, query);
-    else
-        snprintf(ws_url, sizeof(ws_url), "%s://%s:%d%s?%s", ws_scheme, host, port, LIVE_WS_PATH, query);
-
-    curl_easy_cleanup(easy);
-    *out_ws_url = strdup(ws_url);
-    return *out_ws_url ? 0 : -5;
-}
-
-// ------ Phoenix / LWS ------
-static void ws_send_lws(struct lws *wsi, const char *msg) {
-    unsigned char buf[LWS_PRE + 2048];
-    size_t len = strlen(msg); if (len > 2000) len = 2000;
-    memcpy(&buf[LWS_PRE], msg, len);
-    lws_write(wsi, &buf[LWS_PRE], len, LWS_WRITE_TEXT);
-}
-
-static void send_heartbeat(struct lws *wsi) {
-    char ref[32]; make_ref(ref, sizeof(ref));
-    char msg[128];
-    snprintf(msg, sizeof(msg), "[null,\"%s\",\"phoenix\",\"heartbeat\",{}]", ref);
-    ws_send_lws(wsi, msg);
-}
-
-static void send_join_payload(struct lws *wsi, const char *topic) {
-    // Build a LiveView-style join payload:
-    // {"url": g_url, "params":{"_csrf_token":g_csrf(optional), "_mounts":0}, "session": g_session(optional), "static": g_static(optional)}
-    char payload[1536]; size_t L = 0;
-    L += snprintf(payload+L, sizeof(payload)-L, "{\"url\":\"%s\",\"params\":{", g_url[0]?g_url:"/" );
-    int first = 1;
-    if (g_csrf[0]) { L += snprintf(payload+L, sizeof(payload)-L, "\"_csrf_token\":\"%s\"", g_csrf); first=0; }
-    L += snprintf(payload+L, sizeof(payload)-L, "%s\"_mounts\":0},", first? "" : ",");
-    if (g_session[0]) L += snprintf(payload+L, sizeof(payload)-L, "\"session\":\"%s\",", g_session);
-    if (g_static[0])  L += snprintf(payload+L, sizeof(payload)-L, "\"static\":\"%s\",",  g_static);
-    if (payload[L-1] == ',') payload[--L] = 0; // trim trailing comma
-    L += snprintf(payload+L, sizeof(payload)-L, "}");
-
-    char ref[32]; make_ref(ref, sizeof(ref));
-    char frame[2048];
-    snprintf(frame, sizeof(frame), "[\"%s\",\"%s\",\"%s\",\"phx_join\",%s]", ref, ref, topic, payload);
-    ws_send_lws(wsi, frame);
-}
-
-static int extract_lv_topic(const char *s, char *out, size_t outsz) {
-    const char *p = strstr(s, "lv:phx-"); if (!p) return 0;
-    const char *e = strchr(p, '"'); if (!e) return 0;
-    size_t n = (size_t)(e - p); if (n >= outsz) n = outsz - 1;
-    strncpy(out, p, n); out[n] = 0;
-    return strcmp(out, "lv:phx-0") != 0;
-}
-
-static void parse_daily_first_row_for_used_exp(const char *s) {
-    const char *d = strstr(s, "\"d\":[["); if (!d) return; d += 5;
-    const char *row = strchr(d, '['); if (!row) return;
-    int depth = 0; const char *p = row;
-    while (*p) { if (*p=='[') depth++; else if (*p==']'){ depth--; if(depth==0){ p++; break; } } p++; if (p-row>3000) break; }
-    if (depth != 0) return;
-    char buf[1600]; size_t n=(size_t)(p-row); if(n>=sizeof(buf)) n=sizeof(buf)-1; memcpy(buf,row,n); buf[n]=0;
-    int col=0; char *save=NULL; char *tok=strtok_r(buf,",",&save);
-    while (tok) {
-        while (*tok==' '||*tok=='['||*tok=='\"') tok++;
-        size_t TL=strlen(tok); while(TL && (tok[TL-1]==' '||tok[TL-1]==']'||tok[TL-1]=='\"')) tok[--TL]=0;
-        if (col==5) grid_used=atof(tok); else if (col==6) grid_exp=atof(tok);
-        if (grid_used>=0.0 && grid_exp>=0.0) break;
-        col++; tok=strtok_r(NULL,",",&save);
-    }
-}
-
-static int cb(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
-    (void)user;
-    switch (reason) {
-        case LWS_CALLBACK_CLIENT_ESTABLISHED:
-            last_hb = time(NULL);
-            // Kick off heartbeat loop; server will soon hint the real topic in its pushes
-            // (We don't send any join yet here — only after we learn the topic)
-            break;
-
-        case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER: {
-            unsigned char **p = (unsigned char **)in;
-            unsigned char *end = (*p) + len;
-            if (g_cookie[0]) {
-                (void) lws_add_http_header_by_name(wsi, (const unsigned char *)"Cookie:",
-                    (const unsigned char *)g_cookie, (int)strlen(g_cookie), p, end);
-            }
-            if (g_origin[0]) {
-                (void) lws_add_http_header_by_name(wsi, (const unsigned char *)"Origin:",
-                    (const unsigned char *)g_origin, (int)strlen(g_origin), p, end);
-            }
-            break;
-        }
-
-        case LWS_CALLBACK_CLIENT_WRITEABLE:
-            if (difftime(time(NULL), last_hb) >= 25) { send_heartbeat(wsi); last_hb = time(NULL); }
-            break;
-
-        case LWS_CALLBACK_CLIENT_RECEIVE: {
-            char msg[8192]; size_t ncopy = len < sizeof(msg)-1 ? len : sizeof(msg)-1;
-            memcpy(msg, in, ncopy); msg[ncopy] = 0;
-
-            // learn & join the real LiveView topic once
-            if (!joined) {
-                char tmp[128];
-                if (extract_lv_topic(msg, tmp, sizeof(tmp))) {
-                    strncpy(lv_topic, tmp, sizeof(lv_topic)-1); lv_topic[sizeof(lv_topic)-1]=0;
-                    send_join_payload(wsi, lv_topic);
-                    joined = 1;
-                    last_hb = time(NULL);
-                }
-            }
-
-            if (strstr(msg, "\"diff\"")) {
-                parse_daily_first_row_for_used_exp(msg);
-                if (grid_used >= 0.0 && grid_exp >= 0.0) {
-                    double profit = grid_exp * EXPORT_TARIFF - grid_used * IMPORT_TARIFF;
-                    printf("Used: %.2f kWh, Exported: %.2f kWh → Profit: %.2f\n", grid_used, grid_exp, profit);
-
-                    MQTTClient_message pubmsg = MQTTClient_message_initializer;
-                    char payload[64]; snprintf(payload, sizeof(payload), "%.2f", profit);
-                    pubmsg.payload = payload; pubmsg.payloadlen = (int)strlen(payload);
-                    pubmsg.qos = 1; pubmsg.retained = 0;
-                    MQTTClient_deliveryToken token;
-                    MQTTClient_publishMessage(mqtt, MQTT_TOPIC, &pubmsg, &token);
-                    MQTTClient_waitForCompletion(mqtt, token, 1500);
-
-                    done = 1;
-                }
-            }
-            break;
-        }
-
-        case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
-            fprintf(stderr, "WebSocket connection error\n");
-            done = 1;
-            break;
-        default: break;
-    }
-    return 0;
-}
-
-static struct lws_protocols protocols[] = { { "ws", cb, 0, 8192 }, { NULL, NULL, 0, 0 } };
-
-static void parse_ws_url(const char *url, char *host, int *port, char *path, size_t psz, int *is_tls) {
-    const char *p = strstr(url, "://"); *is_tls = 0;
-    if (p) { if (!strncasecmp(url, "wss", 3)) *is_tls = 1; p += 3; } else p = url;
-    const char *slash = strchr(p,'/'); const char *colon = strchr(p,':');
-    if (slash && colon && colon < slash) { size_t hlen=(size_t)(colon-p); strncpy(host,p,hlen); host[hlen]=0; *port=atoi(colon+1); }
-    else { size_t hlen= slash ? (size_t)(slash-p) : strlen(p); strncpy(host,p,hlen); host[hlen]=0; *port=*is_tls?443:80; }
-    if (slash) { strncpy(path, slash, psz-1); path[psz-1]=0; } else { strncpy(path, "/", psz-1); path[psz-1]=0; }
-}
-
 int main(int argc, char **argv) {
-    const char *http_base = (argc > 1) ? argv[1] : DEFAULT_HTTP_BASE;
+    const char *http_url = (argc > 1) ? argv[1] : DEFAULT_HTTP_URL;
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    // Build WS URL and collect cookies/csrf/session/static/url
-    char *ws_url = NULL;
-    if (http_boot_and_build_ws(http_base, &ws_url) != 0 || !ws_url) {
-        fprintf(stderr, "Failed to prepare WS URL from %s\n", http_base);
-        curl_global_cleanup(); return 1;
+    struct mem page = {0};
+    if (http_get(http_url, &page) != 0 || !page.data || !page.len) {
+        fprintf(stderr, "Failed to fetch page: %s\n", http_url);
+        curl_global_cleanup();
+        return 1;
     }
-    fprintf(stderr, "WS URL: %s\n", ws_url);
-    if (g_cookie[0]) fprintf(stderr, "Cookie: %s\n", g_cookie);
-    if (g_origin[0]) fprintf(stderr, "Origin: %s\n", g_origin);
-    if (g_session[0]) fprintf(stderr, "session: %.32s...\n", g_session);
-    if (g_static[0])  fprintf(stderr, "static:  %.32s...\n", g_static);
 
-    // MQTT connect
+    double used = -1.0, exp = -1.0;
+
+    // Try in order: chart JSON -> headers/labels
+    if (!try_extract_from_chart_json(page.data, &used, &exp)) {
+        (void)try_extract_from_table_headers(page.data, &used, &exp);
+    }
+
+    free(page.data);
+
+    if (used < 0.0 || exp < 0.0) {
+        fprintf(stderr, "Could not find both Used and Export numbers on the page.\n");
+        curl_global_cleanup();
+        return 2;
+    }
+
+    double profit = exp * EXPORT_TARIFF - used * IMPORT_TARIFF;
+    printf("Used: %.2f kWh, Exported: %.2f kWh -> Profit: %.2f (£)\n", used, exp, profit);
+
+    // Publish to MQTT
+    MQTTClient mqtt;
     MQTTClient_connectOptions opts = MQTTClient_connectOptions_initializer;
     MQTTClient_create(&mqtt, MQTT_HOST, MQTT_CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
-    opts.keepAliveInterval = 20; opts.cleansession = 1; opts.username = MQTT_USER; opts.password = MQTT_PASS;
+    opts.keepAliveInterval = 20;
+    opts.cleansession = 1;
+    opts.username = MQTT_USER;
+    opts.password = MQTT_PASS;
     if (MQTTClient_connect(mqtt, &opts) != MQTTCLIENT_SUCCESS) {
         fprintf(stderr, "Failed to connect to MQTT broker\n");
-        free(ws_url); curl_global_cleanup(); return 1;
+        MQTTClient_destroy(&mqtt);
+        curl_global_cleanup();
+        return 3;
     }
 
-    // LWS
-    struct lws_context_creation_info info; memset(&info, 0, sizeof(info));
-    info.port = CONTEXT_PORT_NO_LISTEN; info.protocols = protocols;
-    struct lws_context *context = lws_create_context(&info);
-    if (!context) { fprintf(stderr, "Failed to create lws context\n"); free(ws_url); curl_global_cleanup(); return 1; }
+    MQTTClient_message pubmsg = MQTTClient_message_initializer;
+    char payload[64];
+    snprintf(payload, sizeof(payload), "%.2f", profit);
+    pubmsg.payload = payload;
+    pubmsg.payloadlen = (int)strlen(payload);
+    pubmsg.qos = 1;
+    pubmsg.retained = 0;
+    MQTTClient_deliveryToken token;
+    MQTTClient_publishMessage(mqtt, MQTT_TOPIC, &pubmsg, &token);
+    MQTTClient_waitForCompletion(mqtt, token, 1500);
 
-    char host[256], path[1024]; int port=80, is_tls=0;
-    parse_ws_url(ws_url, host, &port, path, sizeof(path), &is_tls);
-
-    struct lws_client_connect_info ccinfo; memset(&ccinfo, 0, sizeof(ccinfo));
-    ccinfo.context = context; ccinfo.address = host; ccinfo.port = port; ccinfo.path = path;
-    ccinfo.host = host; ccinfo.origin = host; ccinfo.protocol = "ws";
-#if LWS_LIBRARY_VERSION_MAJOR >= 4
-    ccinfo.ssl_connection = is_tls ? LCCSCF_USE_SSL : 0;
-#endif
-
-    if (!lws_client_connect_via_info(&ccinfo)) {
-        fprintf(stderr, "Failed to connect WebSocket\n");
-        lws_context_destroy(context); free(ws_url); curl_global_cleanup(); return 1;
-    }
-
-    start_ts = time(NULL);
-
-    while (!done) {
-        lws_service(context, 100);
-        lws_callback_on_writable_all_protocol(context, &protocols[0]);
-        if (difftime(time(NULL), start_ts) >= TIMEOUT_SEC) {
-            fprintf(stderr, "Timed out waiting for totals.\n");
-            break;
-        }
-    }
-
-    lws_context_destroy(context);
     MQTTClient_disconnect(mqtt, 1000);
     MQTTClient_destroy(&mqtt);
-    free(ws_url);
     curl_global_cleanup();
 
-    return done ? 0 : 2;
+    return 0;
 }
