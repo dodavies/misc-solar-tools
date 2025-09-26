@@ -1,1 +1,230 @@
-fuck off shit code
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+#include <signal.h>
+#include "MQTTClient.h"
+
+// --- Shared MQTT credentials for both brokers ---
+#define USERNAME        "mqttuser"
+#define PASSWORD        "mqttuser"
+
+// --- Input Broker ---
+#define IN_ADDRESS      "tcp://192.168.0.177:1883"
+#define IN_CLIENTID     "solar-profit-subscriber"
+
+// --- Output Broker ---
+#define OUT_ADDRESS     "tcp://192.168.0.160:1883"
+#define OUT_CLIENTID    "solar-profit-publisher"
+
+// --- MQTT Topics ---
+#define USED_TOPIC      "solarassistant/total/grid_energy_in"
+#define EXPORTED_TOPIC  "solarassistant/total/grid_energy_out"
+#define OUTPUT_TOPIC    "home/solar/profit"
+
+#define QOS             1
+#define TIMEOUT         10000L
+
+static MQTTClient client_in;
+static MQTTClient client_out;
+
+static volatile int keep_running = 1;
+static int published_once = 0;
+static int debug = 0;
+
+static double used = -1;
+static double exported = -1;
+static time_t last_msg_ts = 0;
+
+// ---- helpers ---------------------------------------------------------------
+static void flush() { fflush(stdout); fflush(stderr); }
+
+static const char* ts()
+{
+    static char buf[32];
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_now);
+    return buf;
+}
+
+static void handle_sigint(int sig)
+{
+    (void)sig;
+    keep_running = 0;
+    if (debug) fprintf(stderr, "[%s] SIGINT received, shutting down...\n", ts());
+    flush();
+}
+
+// Paho trace hook
+static void trace_callback(enum MQTTCLIENT_TRACE_LEVELS level, char* message)
+{
+    if (debug) {
+        fprintf(stderr, "[%s] [PAHO %d] %s\n", ts(), level, message ? message : "(null)");
+        flush();
+    }
+}
+
+// connection lost callback
+static void connlost(void *context, char *cause)
+{
+    if (debug) {
+        const char* which = (context == &client_in) ? "INPUT" :
+                            (context == &client_out) ? "OUTPUT" : "UNKNOWN";
+        fprintf(stderr, "[%s] [CONNLOST %s] cause: %s\n", ts(), which, cause ? cause : "(none)");
+        flush();
+    }
+}
+
+// delivery complete callback (for OUT client)
+static void delivered(void *context, MQTTClient_deliveryToken dt)
+{
+    if (debug) {
+        (void)context;
+        fprintf(stdout, "[%s] [DELIVERED] token=%d\n", ts(), dt);
+        flush();
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+static void maybe_publish_profit()
+{
+    if (used >= 0 && exported >= 0 && !published_once) {
+        double profit = (exported * 0.15) - (used * 0.07);
+
+        char result[32];
+        snprintf(result, sizeof(result), "%.2f", profit);
+
+        MQTTClient_message pubmsg = MQTTClient_message_initializer;
+        MQTTClient_deliveryToken token = 0;
+        pubmsg.payload = result;
+        pubmsg.payloadlen = (int)strlen(result);
+        pubmsg.qos = QOS;
+        pubmsg.retained = 0;
+
+        printf("%s %s\n", OUTPUT_TOPIC, result);
+        flush();
+
+        int rc = MQTTClient_publishMessage(client_out, OUTPUT_TOPIC, &pubmsg, &token);
+        if (debug) fprintf(stdout, "[%s] [PUB] publish rc=%d token=%d\n", ts(), rc, token);
+        flush();
+
+        if (rc == MQTTCLIENT_SUCCESS) {
+            MQTTClient_waitForCompletion(client_out, token, TIMEOUT);
+            published_once = 1;
+            keep_running = 0;
+        }
+    }
+}
+
+static int messageArrived(void* context, char* topicName, int topicLen, MQTTClient_message* message)
+{
+    (void)context;
+    char topic[256] = {0};
+    if (topicLen > 0) {
+        int len = (topicLen < (int)sizeof(topic)-1) ? topicLen : (int)sizeof(topic)-1;
+        memcpy(topic, topicName, len);
+        topic[len] = '\0';
+    } else {
+        strncpy(topic, topicName, sizeof(topic)-1);
+    }
+
+    char payload[128] = {0};
+    int len = (message->payloadlen < (int)sizeof(payload)-1) ? message->payloadlen : (int)sizeof(payload)-1;
+    memcpy(payload, message->payload, len);
+    payload[len] = '\0';
+
+    printf("%s %s\n", topic, payload);
+    flush();
+
+    last_msg_ts = time(NULL);
+
+    double value = atof(payload);
+    if (strcmp(topic, USED_TOPIC) == 0) {
+        used = value;
+    } else if (strcmp(topic, EXPORTED_TOPIC) == 0) {
+        exported = value;
+    }
+
+    maybe_publish_profit();
+
+    MQTTClient_freeMessage(&message);
+    MQTTClient_free(topicName);
+    return 1;
+}
+
+int main(int argc, char* argv[])
+{
+    if (argc > 1 && strcmp(argv[1], "-d") == 0) {
+        debug = 1;
+    }
+
+    signal(SIGINT, handle_sigint);
+
+    if (debug) {
+        MQTTClient_setTraceCallback(trace_callback);
+        MQTTClient_setTraceLevel(MQTTCLIENT_TRACE_PROTOCOL);
+    }
+
+    // --- OUTPUT broker setup first ---
+    MQTTClient_connectOptions out_opts = MQTTClient_connectOptions_initializer;
+    MQTTClient_create(&client_out, OUT_ADDRESS, OUT_CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+    MQTTClient_setCallbacks(client_out, &client_out, connlost, NULL, delivered);
+
+    out_opts.keepAliveInterval = 20;
+    out_opts.cleansession = 1;
+    out_opts.username = USERNAME;
+    out_opts.password = PASSWORD;
+    out_opts.connectTimeout = 5;
+    out_opts.retryInterval = 1;
+
+    int rc = MQTTClient_connect(client_out, &out_opts);
+    if (rc != MQTTCLIENT_SUCCESS) {
+        if (debug) fprintf(stderr, "Failed to connect to OUTPUT broker, rc=%d\n", rc);
+        return 1;
+    }
+
+    // --- INPUT broker ---
+    MQTTClient_connectOptions in_opts = MQTTClient_connectOptions_initializer;
+    MQTTClient_create(&client_in, IN_ADDRESS, IN_CLIENTID, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+    MQTTClient_setCallbacks(client_in, &client_in, connlost, messageArrived, NULL);
+
+    in_opts.keepAliveInterval = 20;
+    in_opts.cleansession = 1;
+    in_opts.username = USERNAME;
+    in_opts.password = PASSWORD;
+    in_opts.connectTimeout = 5;
+    in_opts.retryInterval = 1;
+
+    rc = MQTTClient_connect(client_in, &in_opts);
+    if (rc != MQTTCLIENT_SUCCESS) {
+        if (debug) fprintf(stderr, "Failed to connect to INPUT broker, rc=%d\n", rc);
+        goto CLEANUP_OUT_ONLY;
+    }
+
+    MQTTClient_subscribe(client_in, USED_TOPIC, QOS);
+    MQTTClient_subscribe(client_in, EXPORTED_TOPIC, QOS);
+
+    last_msg_ts = time(NULL);
+
+    // Main loop
+    while (keep_running) {
+        sleep(1);
+
+        // Exit if no input messages for 30s
+        if (time(NULL) - last_msg_ts > 30 && !published_once) {
+            if (debug) fprintf(stderr, "Timeout: no messages within 30s\n");
+            keep_running = 0;
+        }
+    }
+
+    MQTTClient_disconnect(client_in, 3000);
+    MQTTClient_destroy(&client_in);
+CLEANUP_OUT_ONLY:
+    MQTTClient_disconnect(client_out, 3000);
+    MQTTClient_destroy(&client_out);
+    return 0;
+}
